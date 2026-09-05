@@ -1,0 +1,8 @@
+node_modules/
+.env
+.token.json
+captcha.jpg
+*.log
+
+.chrome-profile/
+inbox/

@@ -1,0 +1,6 @@
+{
+  "watch": ["watch.js", "duoke-api.js", "duoke-realtime.js", "duoke-auth.js", "duoke-session.js", ".env"],
+  "ext": "js,json",
+  "ignore": ["node_modules", "*.log", ".token.json", "captcha.jpg"],
+  "delay": "500"
+}

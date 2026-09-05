@@ -1,0 +1,31 @@
+{
+  "name": "duoke-tools",
+  "version": "1.0.0",
+  "private": true,
+  "type": "module",
+  "description": "เครื่องมือยิง API ของ Duoke — ตอบแชท / แชทเด้ง / แท็ก / คำสั่งซื้อ / สินค้า",
+  "main": "watch.js",
+  "scripts": {
+    "dev": "nodemon watch.js",
+    "start": "node watch.js",
+    "login": "node duoke-session.js",
+    "history": "node history.js",
+    "reply": "node reply.js",
+    "inbox": "node inbox.js",
+    "example": "node example.js",
+    "ai-test": "node ai-test.js",
+    "relogin": "node duoke-session.js --force"
+  },
+  "dependencies": {
+    "@anthropic-ai/sdk": "^0.124.0",
+    "openai": "^7.10.0",
+    "puppeteer-core": "^23.11.1",
+    "socket.io-client": "^4.7.5"
+  },
+  "devDependencies": {
+    "nodemon": "^3.1.0"
+  },
+  "engines": {
+    "node": ">=18"
+  }
+}
