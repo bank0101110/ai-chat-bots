@@ -10,6 +10,12 @@
  *   ONLY_BUYER=true                 ← log เฉพาะข้อความจากลูกค้า (default: true)
  *   LOG_FILE=chat.log               ← เขียน log ลงไฟล์ด้วย (เว้นว่าง = ไม่เขียน)
  *   SHOW_CONVERSATIONS=false        ← log ตอนรายการห้องแชทอัปเดตด้วย
+ *   LOG_CONSOLE_MAX=160             ← ย่อข้อความบนจอกี่ตัวอักษร (ในไฟล์ log เก็บเต็มเสมอ)
+ *   LOG_RAW=true                    ← แนบ JSON ดิบของข้อความ+ห้องแชทไว้ในไฟล์ log (default: true)
+ *
+ * เรื่อง log: บนจอย่อให้อ่านง่าย แต่ในไฟล์ LOG_FILE เก็บครบ — ข้อความเต็ม ไม่ตัด …,
+ * การ์ดสินค้า/ออร์เดอร์กางเป็นช่อง ๆ (ชื่อ ตัวเลือก ราคา จำนวน itemId ลิงก์) และถ้า
+ * LOG_RAW=true จะมีบรรทัด "↳ raw {...}" ต่อท้ายทุกข้อความ = ข้อมูลดิบทั้งหมดที่ดึงมาได้
  *
  * ลำดับการทำงาน:
  *   1. หา token ที่ใช้ได้ — จากแคช .token.json ก่อน ถ้าใช้ไม่ได้ค่อยล็อกอินด้วย email/password
@@ -40,7 +46,15 @@ const SHOW_CONVERSATIONS = process.env.SHOW_CONVERSATIONS === 'true';
 const AUTO_TAG = (process.env.AUTO_TAG ?? 'true') !== 'false';
 const AUTO_TAG_NAME = process.env.AUTO_TAG_NAME || 'รอเจ้าหน้าที่';
 const AUTO_TAG_AI_NAME = process.env.AUTO_TAG_AI_NAME || 'AI ตอบ';
+// ห้องเดิมส่ง "คำตอบเบื้องต้น" ซ้ำได้เร็วสุดกี่นาที (ลูกค้ามักพิมพ์รัวหลายข้อความติดกัน)
+const HOLDING_COOLDOWN_MS = Number(process.env.AI_HOLDING_COOLDOWN_MIN || 30) * 60_000;
 const LOG_FILE = process.env.LOG_FILE ? path.join(__dirname, process.env.LOG_FILE) : null;
+// ในไฟล์ log เก็บข้อความเต็มเสมอ (ไม่ตัด …) ส่วนบนจอย่อให้อ่านง่ายตาม LOG_CONSOLE_MAX
+const LOG_CONSOLE_MAX = Number(process.env.LOG_CONSOLE_MAX || 160);
+// เขียน JSON ดิบของทุกข้อความ + ข้อมูลห้องแชทลงไฟล์ log ด้วย (ปิดด้วย LOG_RAW=false)
+const LOG_RAW = (process.env.LOG_RAW ?? 'true') !== 'false';
+// แนบคำสั่งซื้อจริงของลูกค้าให้ AI: auto = เฉพาะตอนลูกค้าถามเรื่องออร์เดอร์ · always · off
+const ORDER_CONTEXT = (process.env.AI_ORDER_CONTEXT || 'auto').toLowerCase();
 
 const LOGIN_METHOD = (process.env.DUOKE_LOGIN || 'browser').toLowerCase();
 // โหมด browser: พิมพ์รหัสผ่านในเบราว์เซอร์เอง จึงไม่บังคับ DUOKE_PASSWORD ใน .env
@@ -83,7 +97,22 @@ function log(line, plain = null) {
   if (LOG_FILE) fs.appendFile(LOG_FILE, `${plain ?? stripAnsi(line)}\n`, () => {});
 }
 
+/** เขียนลงไฟล์ log อย่างเดียว ไม่ขึ้นจอ (ใช้กับ JSON ดิบที่ยาวมาก) */
+function logFile(text) {
+  if (LOG_FILE) fs.appendFile(LOG_FILE, `${text}\n`, () => {});
+}
+
+/**
+ * log บรรทัดที่มีเนื้อความยาว — บนจอย่อให้พอดีตา แต่ในไฟล์เก็บเต็มไม่ตัด
+ * (ชื่อสินค้าบน Shopee ยาว 100+ ตัวอักษร ถ้าตัดจะหาย่อไม่รู้ว่าลูกค้าถามตัวไหน)
+ */
+function logLong(prefix, body) {
+  const full = String(body ?? '');
+  log(`${prefix}${preview(full, LOG_CONSOLE_MAX)}`, stripAnsi(`${prefix}${oneLine(full)}`));
+}
+
 const stripAnsi = s => s.replace(/\x1b\[[0-9;]*m/g, '');
+const oneLine = s => String(s ?? '').replace(/\r?\n/g, ' ⏎ ').replace(/\s+/g, ' ').trim();
 
 /** อ่าน .env แบบง่าย ไม่ต้องลง dotenv */
 function loadEnv(file) {
@@ -105,24 +134,74 @@ function loadEnv(file) {
   }
 }
 
-function preview(text, max = 160) {
-  const one = String(text ?? '').replace(/\s+/g, ' ').trim();
+function preview(text, max = LOG_CONSOLE_MAX) {
+  const one = oneLine(text);
   return one.length > max ? one.slice(0, max) + '…' : one;
 }
 
+const CURRENCY_NAME = { THB: 'บาท', USD: 'ดอลลาร์', SGD: 'ดอลลาร์สิงคโปร์', MYR: 'ริงกิต', VND: 'ดอง', IDR: 'รูเปียห์' };
+
+/** "1089.00000" → "1089 บาท" · "132.50000" → "132.50 บาท" */
+function money(price, currency) {
+  const n = Number(price);
+  if (!Number.isFinite(n)) return String(price ?? '').trim();
+  return `${Number.isInteger(n) ? n : n.toFixed(2)} ${CURRENCY_NAME[currency] ?? currency ?? ''}`.trim();
+}
+
+/** ต่อเป็น "ก: ข · ค: ง" เฉพาะช่องที่มีค่า */
+const fields = pairs => pairs.filter(([, v]) => v !== undefined && v !== null && v !== '').map(([k, v]) => `${k}: ${v}`).join(' · ');
+
+/** การ์ดสินค้า — Shopee ใช้ messageType 'item', TikTok ใช้ 'goods_card', อื่น ๆ ใช้ 'product' */
+const itemCard = c => fields([
+  ['ชื่อ', oneLine(c.title)],
+  ['ตัวเลือก', oneLine(c.skuValue ?? c.skuName)],
+  ['ราคา', c.price ? money(c.price, c.currency) : ''],
+  ['ราคาเดิม', c.originalPrice && c.originalPrice !== c.price ? money(c.originalPrice, c.currency) : ''],
+  ['จำนวน', c.quantity],
+  ['พรีออเดอร์', Number(c.isPreOrder) ? 'ใช่' : ''],
+  ['itemId', c.itemId],
+  ['ลิงก์', c.actionUrl || c.itemUrl || ''],
+]);
+
+/** การ์ดออร์เดอร์ — 'order' (Shopee/Lazada) หรือ 'order_card' (TikTok) */
+const orderCard = c => fields([
+  ['orderId', c.orderId ?? c.orderSn ?? c.orderNumber],
+  ['สินค้า', oneLine(c.productName ?? c.title ?? c.itemTitle)],
+  ['ตัวเลือก', oneLine(c.skuValue ?? c.skuName)],
+  ['ราคา', c.price ? money(c.price, c.currency) : ''],
+  ['ยอดรวม', c.totalAmount ? money(c.totalAmount, c.currency) : ''],
+  ['จำนวน', c.quantity],
+  ['สถานะ', oneLine(c.statusText ?? c.status)],
+  ['ลิงก์', c.actionUrl || ''],
+]);
+
+/**
+ * บรรยายข้อความ 1 ข้อความ — ค่าที่คืนไปใช้กับ logLong() ซึ่งจะย่อเฉพาะบนจอ
+ * ส่วนในไฟล์ log ได้ข้อความเต็ม (ชื่อสินค้ายาว ๆ ไม่โดนตัด)
+ */
 function describe(msg) {
   const c = parseMessageContent(msg) || {};
-  switch (msg.messageType) {
+  const tag = t => `${C.dim}[${t}]${C.reset} `;
+  // ชนิดข้อความต่างแพลตฟอร์ม: shopee=item/file_image/unknown · tiktok=goods_card/order_card · lazada=1/10007
+  switch (String(msg.messageType)) {
     case 'text':
-    case 'attachment_text': return preview(c.text);
-    case 'image': return `${C.dim}[รูปภาพ]${C.reset} ${c.imageUrl ?? ''}`;
-    case 'video': return `${C.dim}[วิดีโอ]${C.reset} ${c.videoUrl ?? ''}`;
-    case 'sticker': return `${C.dim}[สติกเกอร์]${C.reset}`;
-    case 'product': return `${C.dim}[การ์ดสินค้า]${C.reset} itemId=${c.itemId ?? '-'}`;
-    case 'order': return `${C.dim}[การ์ดออร์เดอร์]${C.reset} orderId=${c.orderId ?? '-'}`;
-    case 'voucher': return `${C.dim}[คูปอง]${C.reset} ${c.promotionId ?? ''}`;
-    case 'file': return `${C.dim}[ไฟล์]${C.reset} ${c.fileName ?? ''}`;
-    default: return `${C.dim}[${msg.messageType}]${C.reset} ${preview(c.text ?? JSON.stringify(c), 100)}`;
+    case 'attachment_text':
+    case '1': return oneLine(c.text) + (c.translateTxt ? ` ${C.dim}(แปล: ${oneLine(c.translateTxt)})${C.reset}` : '');
+    case 'image':
+    case 'file_image':
+    case 'attachment_image': return tag('รูปภาพ') + (c.imageUrl ?? c.url ?? c.fileUrl ?? '');
+    case 'video': return tag('วิดีโอ') + (c.videoUrl ?? '');
+    case 'sticker': return tag('สติกเกอร์') + (c.imageUrl ?? '');
+    case 'item':
+    case 'goods_card':
+    case 'product': return tag('การ์ดสินค้า') + (itemCard(c) || JSON.stringify(c));
+    case 'order':
+    case 'order_card':
+    case '10007': return tag('การ์ดออร์เดอร์') + (orderCard(c) || JSON.stringify(c));
+    case 'voucher': return tag('คูปอง') + fields([['promotionId', c.promotionId], ['ชื่อ', oneLine(c.title)], ['ส่วนลด', c.discountValue]]);
+    case 'file': return tag('ไฟล์') + fields([['ชื่อไฟล์', c.fileName], ['ลิงก์', c.fileUrl ?? c.url]]);
+    // ชนิดที่ยังไม่รู้จัก → ทิ้ง JSON เต็มไว้ในไฟล์ log จะได้เพิ่ม case ทีหลังได้
+    default: return tag(msg.messageType) + (oneLine(c.text) || JSON.stringify(c));
   }
 }
 
@@ -132,6 +211,7 @@ const isAuthError = err => err?.code === 401 || err?.code === 403 || /401|403/.t
 
 const convCache = new Map();        // conversationId -> conversation object
 const seenMessageIds = new Set();   // กัน log ซ้ำ
+const holdingSentAt = new Map();    // conversationId -> เวลาที่ส่ง "คำตอบเบื้องต้น" ล่าสุด (กันส่งซ้ำ)
 let api = null;
 let rt = null;
 let stopping = false;
@@ -199,6 +279,65 @@ async function removeConversationTag(e, info, tagId, label) {
   }
 }
 
+// ส่ง "คำตอบเบื้องต้น" ให้ลูกค้าตอนที่ยังไม่มีคำตอบที่ส่งได้จริง (เคสละเอียดอ่อนที่ร่างยืนยันไม่ได้ /
+// AI ร่างไม่ได้ / โหมดคิวรอคนตอบ) — ลูกค้าจะได้ไม่เงียบระหว่างรอเจ้าหน้าที่
+// กันสแปม: ห้องหนึ่งส่งได้ครั้งเดียวต่อ HOLDING_COOLDOWN_MS (ลูกค้ามักพิมพ์รัวหลายข้อความติดกัน)
+async function sendHolding(e) {
+  if (!ai.autoSend()) return false;
+  const text = ai.holdingMessage();
+  if (!text) return false;
+
+  const last = holdingSentAt.get(e.conversationId) ?? 0;
+  if (Date.now() - last < HOLDING_COOLDOWN_MS) {
+    log(`${C.gray}          ↳ 💬 ${C.dim}ส่งคำตอบเบื้องต้นไปแล้วเมื่อไม่นานนี้ — ไม่ส่งซ้ำ${C.reset}`);
+    return false;
+  }
+  try {
+    await rt.sendText({
+      shopId: e.shopId, conversationId: e.conversationId, platform: e.platform,
+      text, puid: myPuid,
+    });
+    if (holdingSentAt.size > 1000) holdingSentAt.clear();
+    holdingSentAt.set(e.conversationId, Date.now());
+    logLong(`${C.gray}          ↳ 💬 ${C.green}ตอบเบื้องต้นให้ลูกค้าแล้ว${C.reset} ${C.dim}(รอเจ้าหน้าที่ตามต่อ)${C.reset}: `, text);
+    return true;
+  } catch (err) {
+    if (isAuthError(err)) relogin();
+    else log(`${C.gray}${ts()}${C.reset} ${C.yellow}⚠️  ส่งคำตอบเบื้องต้นไม่สำเร็จ:${C.reset} ${err.message}`);
+    return false;
+  }
+}
+
+/**
+ * ดึงคำสั่งซื้อจริงของลูกค้าห้องนี้จาก Duoke มาให้ AI ใช้ตอบ
+ *
+ * ดึงเมื่อลูกค้าถามเรื่องออร์เดอร์/พัสดุ/ใบกำกับ หรือส่งการ์ดคำสั่งซื้อมาเท่านั้น (AI_ORDER_CONTEXT=auto)
+ * ตั้ง always = ดึงทุกครั้งที่ลูกค้าทัก · off = ไม่ดึงเลย
+ * ต้องมี buyerId (อยู่ใน conversation) ไม่งั้น Duoke คืน list ว่าง
+ */
+async function orderContextFor(e, info, messages) {
+  if (ORDER_CONTEXT === 'off') return '';
+  const buyerId = info.buyerId ?? info.dkConversationVO?.buyerId;
+  if (!buyerId) return '';
+
+  if (ORDER_CONTEXT !== 'always') {
+    const lastBuyer = [...messages].reverse().filter(m => m.fromAccountType === 1).slice(0, 3);
+    if (!lastBuyer.some(m => ai.needsOrderInfo(m))) return '';
+  }
+
+  try {
+    const res = await api.getOrderList({ shopId: e.shopId, buyerId, platform: e.platform, pageSize: 5 });
+    const list = res?.list ?? [];
+    const text = ai.formatOrders(list);
+    if (text) log(`${C.gray}          ↳ 🧾 แนบข้อมูลออร์เดอร์ให้ AI ${list.length} รายการ${C.reset}`);
+    return text;
+  } catch (err) {
+    if (isAuthError(err)) relogin();
+    log(`${C.gray}          ↳ ${C.yellow}⚠️  ดึงออร์เดอร์ของลูกค้าไม่สำเร็จ:${C.reset} ${err.message}`);
+    return '';
+  }
+}
+
 // ให้ AI ร่างคำตอบทุกข้อความ (จุดต่อ AI อยู่ที่ ai-bot.js)
 // จะ "log ร่างคำตอบก่อนเสมอ" แล้วค่อยให้ตัวเรียกจัดการแท็ก
 // คืนสถานะ: 'sent' | 'suggested' | 'staff' | 'declined' | 'disabled' | 'error'
@@ -224,6 +363,7 @@ async function aiRespond(e, info) {
         })),
       });
       log(`${C.gray}          ↳ 📥 ${C.yellow}เข้าคิวให้ Claude Code/คนตอบ${C.reset} (npm run inbox)`);
+      await sendHolding(e);          // ตอบเบื้องต้นไปก่อน ระหว่างรอคนในคิวตอบจริง
       return 'staff';
     }
 
@@ -232,6 +372,7 @@ async function aiRespond(e, info) {
       shopName: info.shopName ?? e.shopId,
       platform: e.platform,
       buyerName: info.buyerNick,
+      orderContext: await orderContextFor(e, info, messages),
     });
 
     // โชว์ token ที่ใช้ไป — cacheR=0 ตลอด แปลว่า prompt caching ไม่ติด (ดู AI_CACHE_TTL ใน .env)
@@ -240,16 +381,37 @@ async function aiRespond(e, info) {
       log(`${C.gray}          ↳ 🎫 in=${u.in} cacheW=${u.cacheWrite} cacheR=${u.cacheRead} out=${u.out}${C.reset}`);
     }
 
-    // ไม่มีร่างคำตอบเลย (ข้อความว่าง/ไม่ใช่คำถาม) → ให้เจ้าหน้าที่
-    if (!r.reply) {
-      log(`${C.gray}          ↳ 🤖 ${C.dim}AI ข้าม (${r.reason ?? 'ไม่มีคำตอบ'})${C.reset}`);
+    // ร้านตอบคำถามนี้ครบไปแล้ว → เงียบไว้ ห้ามส่งอะไรซ้ำให้ลูกค้ารำคาญ
+    if (r.skip) {
+      log(`${C.gray}          ↳ 🤖 ${C.dim}AI ข้าม (${r.reason ?? 'ร้านตอบไปแล้ว'})${C.reset}`);
       return 'declined';
     }
 
-    // เคสละเอียดอ่อน → ร่างไว้ให้เจ้าหน้าที่อ่านก่อนตอบ (ไม่ส่งอัตโนมัติแม้เปิด auto-send)
+    // ไม่มีร่างคำตอบเลย → อย่างน้อยต้องตอบเบื้องต้นให้ลูกค้า แล้วให้เจ้าหน้าที่ตามต่อ
+    if (!r.reply) {
+      log(`${C.gray}          ↳ 🤖 ${C.dim}AI ร่างคำตอบไม่ได้ (${r.reason ?? 'ไม่มีคำตอบ'})${C.reset}`);
+      await sendHolding(e);
+      return 'staff';
+    }
+
+    // เคสละเอียดอ่อน → ส่งคำตอบเบื้องต้นให้ลูกค้าก่อน แล้วยังติดแท็กให้เจ้าหน้าที่ตามไปตอบต่อเสมอ
     if (r.needsStaff) {
       const why = r.reason ? ` ${C.dim}[${r.reason}]${C.reset}` : '';
-      log(`${C.gray}          ↳ 🤖 ${C.yellow}ร่างคำตอบ (ให้เจ้าหน้าที่ตรวจก่อน)${C.reset}${why}: ${preview(r.reply)}`);
+      if (!ai.autoSend()) {
+        logLong(`${C.gray}          ↳ 🤖 ${C.yellow}ร่างคำตอบ${C.reset} ${C.dim}(ยังไม่ส่ง — ตั้ง AI_AUTO_SEND=true)${C.reset}${why}: `, r.reply);
+        return 'staff';
+      }
+      // ร่างมีข้อมูลที่ยืนยันไม่ได้ (เช่น แต่งตัวเลขเอง) → ห้ามส่งร่าง ส่งข้อความสำเร็จรูปแทน
+      if (r.unsafe) {
+        logLong(`${C.gray}          ↳ 🤖 ${C.yellow}ไม่ส่งร่างนี้${C.reset}${why} ${C.dim}ร่างที่ทิ้งไว้ให้เจ้าหน้าที่:${C.reset} `, r.reply);
+        await sendHolding(e);
+        return 'staff';
+      }
+      await rt.sendText({
+        shopId: e.shopId, conversationId: e.conversationId, platform: e.platform,
+        text: r.reply, puid: myPuid,
+      });
+      logLong(`${C.gray}          ↳ 🤖 ${C.green}ตอบเบื้องต้นแล้ว${C.reset} ${C.dim}(รอเจ้าหน้าที่ตามต่อ)${C.reset}${why}: `, r.reply);
       return 'staff';
     }
 
@@ -259,14 +421,15 @@ async function aiRespond(e, info) {
         shopId: e.shopId, conversationId: e.conversationId, platform: e.platform,
         text: r.reply, puid: myPuid,
       });
-      log(`${C.gray}          ↳ 🤖 ${C.green}AI ตอบแล้ว:${C.reset} ${preview(r.reply)}`);
+      logLong(`${C.gray}          ↳ 🤖 ${C.green}AI ตอบแล้ว:${C.reset} `, r.reply);
       return 'sent';
     }
-    log(`${C.gray}          ↳ 🤖 ${C.yellow}AI แนะนำตอบ${C.reset} (ยังไม่ส่ง — ตั้ง AI_AUTO_SEND=true เพื่อส่งจริง): ${preview(r.reply)}`);
+    logLong(`${C.gray}          ↳ 🤖 ${C.yellow}AI แนะนำตอบ${C.reset} (ยังไม่ส่ง — ตั้ง AI_AUTO_SEND=true เพื่อส่งจริง): `, r.reply);
     return 'suggested';
   } catch (err) {
     if (isAuthError(err)) { relogin(); return 'error'; }
     log(`${C.gray}${ts()}${C.reset} ${C.yellow}⚠️  AI ร่างคำตอบไม่สำเร็จ:${C.reset} ${err.message}`);
+    await sendHolding(e);            // AI ล่ม/โควตาหมด ลูกค้าก็ยังต้องได้คำตอบเบื้องต้น
     return 'error';
   }
 }
@@ -299,10 +462,24 @@ function wireEvents() {
           : `${C.dim}ร้าน${C.reset}`;
         const shop = `${pc}${info.shopName ?? e.shopId}·${e.platform}${C.reset}`;
 
-        log(`${C.gray}${ts()}${C.reset} ${fromBuyer ? '💬' : '↩️ '} ${shop} ${who}: ${describe(m)}`);
+        logLong(`${C.gray}${ts()}${C.reset} ${fromBuyer ? '💬' : '↩️ '} ${shop} ${who}: `, describe(m));
 
         if (fromBuyer && info.unReadCount) {
           log(`${C.gray}          ↳ ยังไม่อ่าน ${info.unReadCount} · conversationId=${e.conversationId}${C.reset}`);
+        }
+
+        // ข้อมูลดิบทั้งก้อนที่ดึงมาได้ตอนลูกค้าทัก — ลงไฟล์ log อย่างเดียว ไม่รกจอ
+        if (LOG_RAW) {
+          logFile(`          ↳ raw ${JSON.stringify({
+            event: e,
+            conversation: {
+              conversationId: e.conversationId, shopId: e.shopId, platform: e.platform,
+              shopName: info.shopName, buyerNick: info.buyerNick, buyerId: info.buyerId,
+              unReadCount: info.unReadCount, status: info.status, subStatus: info.subStatus,
+            },
+            message: m,
+            content: parseMessageContent(m),
+          })}`);
         }
       }
 

@@ -248,11 +248,14 @@ export class DuokeApi {
 
   /**
    * ออร์เดอร์ของลูกค้าในห้องแชท — แท็บ "คำสั่งซื้อ" ในแผงขวา
+   *
    * ⚠️ ต้องมี buyerId ไม่งั้นได้ list ว่างเสมอ (buyerId อยู่ใน conversation object)
+   * ⚠️ ส่ง buyerName หรือ conversationId ไปด้วยไม่ได้ — ฝั่งเซิร์ฟเวอร์จะตอบ code -1
+   *    "system error" (buyerName) หรือ list ว่าง (conversationId) → ส่งแค่ 3 ตัวนี้พอ
    */
-  getOrderList({ shopId, buyerId, buyerName, platform, conversationId, pageNo = 1, pageSize = 10 }) {
+  getOrderList({ shopId, buyerId, platform, pageNo = 1, pageSize = 10 }) {
     return this._post('/api/v1/dk/unity/order/list', {
-      shopId, buyerId, buyerName, platform, conversationId, pageNo, pageSize,
+      shopId, buyerId, platform, pageNo, pageSize,
     });
   }
 

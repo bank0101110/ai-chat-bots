@@ -69,8 +69,12 @@ try {
 
   if (!r.reply) {
     console.log(`${C.yellow}AI ไม่ตอบ${C.reset} (${r.reason ?? '-'})`);
+    if (!r.skip) console.log(`${C.gray}→ ของจริงจะส่งข้อความสำเร็จรูปแทน:${C.reset} ${ai.holdingMessage() || '(ปิดอยู่)'}`);
+  } else if (r.unsafe) {
+    console.log(`\n${C.yellow}AI (ร่างนี้ส่งไม่ได้ — ${r.reason}):${C.reset}\n${r.reply}`);
+    console.log(`${C.gray}→ ของจริงจะส่งข้อความสำเร็จรูปแทน:${C.reset} ${ai.holdingMessage() || '(ปิดอยู่)'}`);
   } else if (r.needsStaff) {
-    console.log(`\n${C.yellow}AI (ขอให้เจ้าหน้าที่ตรวจก่อนส่ง):${C.reset}\n${r.reply}`);
+    console.log(`\n${C.yellow}AI (ส่งเป็นคำตอบเบื้องต้น แล้วให้เจ้าหน้าที่ตามต่อ):${C.reset}\n${r.reply}`);
   } else {
     console.log(`\n${C.green}AI (ตอบเองได้):${C.reset}\n${r.reply}`);
   }

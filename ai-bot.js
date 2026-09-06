@@ -12,6 +12,12 @@
  *   2. ตั้ง AI_ENABLED=true            เปิดใช้งาน
  *   3. (ถ้าอยากให้ "ส่งจริง") ตั้ง AI_AUTO_SEND=true — ไม่งั้นจะแค่ "แนะนำคำตอบ" ใน log
  *
+ * ข้อมูลที่ AI ได้เห็นในแต่ละครั้ง:
+ *   - ข้อความ + การ์ดสินค้า/การ์ดคำสั่งซื้อ (กางเป็นรายละเอียดให้ ดู renderForAI)
+ *   - รูปที่ลูกค้าส่งมาจริง ๆ แนบเป็น image block (AI_READ_IMAGES / AI_MAX_IMAGES)
+ *   - คำสั่งซื้อจริงของลูกค้าคนนั้นจาก Duoke — watch.js ส่งมาทาง orderContext
+ *     (ดู formatOrders + needsOrderInfo · ตั้งค่าโหมดที่ AI_ORDER_CONTEXT)
+ *
  * รองรับ 2 เจ้า เลือกด้วย AI_PROVIDER ใน .env:
  *   anthropic (ค่าเริ่มต้น) → Claude   · ใช้ ANTHROPIC_API_KEY · โมเดลเริ่มต้น claude-haiku-4-5
  *   openai                  → GPT      · ใช้ OPENAI_API_KEY    · โมเดลเริ่มต้น gpt-4o-mini
@@ -28,10 +34,22 @@ import { parseMessageContent } from './duoke-api.js';
 const __dirname = path.dirname(fileURLToPath(import.meta.url));
 
 // ธงบรรทัดแรกที่ให้ AI ระบุว่าเคสนี้จัดการยังไง (AI จะ "ร่างคำตอบให้เสมอ")
-//   [[AUTO]]  = คำถามพื้น ๆ ตอบได้เองมั่นใจ (ตอบจริงได้ / ติดแท็ก "AI ตอบ")
-//   [[STAFF]] = เคสละเอียดอ่อน/ไม่มั่นใจ — ร่างไว้ให้ แต่ต้องให้เจ้าหน้าที่ตรวจก่อน (ติดแท็ก "รอเจ้าหน้าที่")
+//   [[AUTO]]  = คำถามพื้น ๆ ตอบได้เองมั่นใจ (ตอบจบในตัว / ติดแท็ก "AI ตอบ")
+//   [[STAFF]] = เคสละเอียดอ่อน/ไม่มั่นใจ — ส่งร่างเป็น "คำตอบเบื้องต้น" ให้ลูกค้าก่อน
+//               แล้วติดแท็ก "รอเจ้าหน้าที่" ให้คนตามไปตอบต่อ (ลูกค้าไม่ถูกปล่อยเงียบ)
 //   [[SKIP]]  = ร้านตอบคำถามนั้นครบไปแล้ว ไม่ต้องตอบซ้ำ
 const MARK_RE = /\[\[\s*(AUTO|STAFF|SKIP)\s*\]\]/i;
+
+// ข้อความ "ตอบเบื้องต้น" สำเร็จรูป — ใช้เมื่อไม่มีร่างที่ส่งให้ลูกค้าได้จริง
+// (ร่างมีตัวเลขที่ยืนยันไม่ได้ / AI ร่างไม่ได้-พลาด / โหมดคิวรอคนตอบ) เพื่อไม่ให้ลูกค้าเงียบ
+// ตั้ง AI_HOLDING_MESSAGE ใน .env เพื่อเปลี่ยนข้อความ · ใส่ค่าว่างเพื่อปิด
+const HOLDING_MESSAGE = 'สวัสดีครับ ทางร้านได้รับข้อความแล้วนะครับ ' +
+  'เรื่องนี้ขอตรวจสอบข้อมูลให้ละเอียดก่อนสักครู่ เดี๋ยวเจ้าหน้าที่จะรีบติดต่อกลับมาตอบให้ครับ';
+
+/** ข้อความตอบเบื้องต้นที่จะส่งให้ลูกค้าระหว่างรอเจ้าหน้าที่ ('' = ปิด ไม่ส่ง) */
+export function holdingMessage() {
+  return (process.env.AI_HOLDING_MESSAGE ?? HOLDING_MESSAGE).trim();
+}
 
 // เลือกเจ้าของ AI: 'anthropic' (Claude, ค่าเริ่มต้น) หรือ 'openai' (GPT)
 const PROVIDER = (process.env.AI_PROVIDER || 'anthropic').toLowerCase();
@@ -43,6 +61,9 @@ function modelName() {
   return PROVIDER === 'openai' ? 'gpt-4o-mini' : 'claude-haiku-4-5';
 }
 const MAX_HISTORY = Number(process.env.AI_MAX_HISTORY || 10);   // กี่ข้อความล่าสุดที่ป้อนให้ AI
+// ให้ AI "ดูรูป" ที่ลูกค้าส่งมาจริง ๆ (ต้องใช้โมเดลที่อ่านรูปได้ — claude ทุกตัว / gpt-4o ขึ้นไป)
+const READ_IMAGES = (process.env.AI_READ_IMAGES ?? 'true') !== 'false';
+const MAX_IMAGES = Number(process.env.AI_MAX_IMAGES || 3);      // แนบกี่รูปล่าสุด (รูปละ ~1-1.6k tokens)
 // ข้อความยาวเกินนี้จะตัดท้ายทิ้ง — กันข้อความ auto-reply ยาว ๆ ของร้าน (100-200 tokens/ข้อความ) กินโควตา
 const MAX_MSG_CHARS = Number(process.env.AI_MAX_MSG_CHARS || 220);
 
@@ -167,11 +188,20 @@ export function lastUsage() { return _lastUsage; }
 async function callLLM({ systemBlocks, messages, maxTokens }) {
   if (PROVIDER === 'openai') {
     // OpenAI: system เป็นข้อความเดียว (แคชอัตโนมัติฝั่ง OpenAI ไม่ต้องใส่ cache_control)
+    // และบล็อกรูปคนละรูปแบบกับ Anthropic → แปลง image → image_url ก่อนส่ง
     const systemText = systemBlocks.map(b => b.text).join('\n\n');
+    const msgs = messages.map(m => ({
+      role: m.role,
+      content: Array.isArray(m.content)
+        ? m.content.map(b => (b.type === 'image'
+          ? { type: 'image_url', image_url: { url: b.source.url } }
+          : { type: 'text', text: b.text }))
+        : m.content,
+    }));
     const res = await getOpenAI().chat.completions.create({
       model: modelName(),
       max_tokens: maxTokens,
-      messages: [{ role: 'system', content: systemText }, ...messages],
+      messages: [{ role: 'system', content: systemText }, ...msgs],
     });
     return (res.choices?.[0]?.message?.content ?? '').trim();
   }
@@ -224,7 +254,11 @@ export function buildSystemPrompt({ shopName, platform, buyerName }) {
       'รูปแบบ: บรรทัดแรกใส่ธงเดียว แล้วขึ้นบรรทัดใหม่เขียนร่างคำตอบถึงลูกค้า ไม่เกิน 3 ประโยค',
       '  [[AUTO]]  = มีข้อมูลตอบได้ชัด (ทักทาย วิธีสั่งซื้อ เวลาทำการ ข้อมูลที่มีในข้อมูลร้าน ราคาบนการ์ด)',
       '  [[STAFF]] = ไม่มีข้อมูล หรือเคสละเอียดอ่อน (ต่อรอง เคลม คืนเงิน ปัญหาจัดส่ง สต็อก สเปกที่ไม่มีในข้อมูล)',
-      'ต้องร่างคำตอบให้เสมอทั้งสองแบบ ธง STAFF แค่แปลว่าให้เจ้าหน้าที่ตรวจก่อนส่ง',
+      'ต้องร่างคำตอบให้เสมอทั้งสองแบบ และร่างจะถูกส่งถึงลูกค้าจริงทันที',
+      'จึงต้องเขียนเป็นข้อความที่ส่งได้เลย ห้ามเขียนโน้ตถึงเจ้าหน้าที่หรือเว้นช่องให้เติม',
+      'ธง STAFF = ส่งร่างนี้เป็น "คำตอบเบื้องต้น" ก่อน แล้วเจ้าหน้าที่จะตามไปตอบต่อ',
+      'ร่างของ STAFF ให้ทวนสิ่งที่ลูกค้าถาม + บอกว่ากำลังตรวจสอบ + เจ้าหน้าที่จะติดต่อกลับ',
+      'ห้ามรับปากแทนเจ้าหน้าที่ (ห้ามบอกว่าลดให้ได้ เคลมได้ คืนเงินได้ ของมีสต็อก)',
       '',
       'บรรทัด [ทางร้านตอบไปแล้วว่า: ...] = ข้อความที่ร้านส่งแทรกไปหลังลูกค้าพิมพ์',
       'ถ้าเป็นข้อความอัตโนมัติ (ทักทาย ขอให้รอ นอกเวลาทำการ) ให้ตอบคำถามลูกค้าตามปกติ',
@@ -239,6 +273,20 @@ export function buildSystemPrompt({ shopName, platform, buyerName }) {
       'การ์ดสินค้า (ข้อความขึ้นต้นว่า [ลูกค้าส่งการ์ดสินค้า]) = ลูกค้าสนใจตัวนั้น แม้ไม่ได้พิมพ์อะไรมา',
       'ห้ามตอบกลาง ๆ ว่าสอบถามด้านใด ให้ทวน ชื่อ+ตัวเลือก+ราคา จากการ์ด แล้วถามต่อว่าต้องการกี่ชิ้น',
       'ราคาบนการ์ดคือราคาจริงบนหน้าร้าน ใช้ยืนยันได้ · หลายใบ = กำลังเทียบ ให้พูดถึงทุกใบ',
+      '',
+      'รูปที่ลูกค้าส่งมา: ดูรูปแล้วบอกสิ่งที่เห็นจริง ๆ ห้ามเดาสิ่งที่มองไม่ชัด',
+      'รูปสินค้า/หน้าจอสินค้า → ทวนว่าเห็นอะไร แล้วถามให้ชัดว่าต้องการสอบถามเรื่องใด',
+      'รูปสลิปโอนเงิน ใบเสร็จ หน้าจอคำสั่งซื้อ → อ่านเลข/ยอดในรูปมาทวนได้ แต่ห้ามยืนยันว่าเงินเข้าแล้ว ใส่ธง [[STAFF]]',
+      'รูปของเสียหาย ของผิด ของขาด → ทวนสิ่งที่เห็นในรูป ขอเลขคำสั่งซื้อ แล้วใส่ธง [[STAFF]] เสมอ',
+      '',
+      'บล็อก [ข้อมูลคำสั่งซื้อของลูกค้าคนนี้ ...] = ออร์เดอร์จริงจากระบบหลังร้าน เชื่อถือได้',
+      'ลูกค้าถามถึงออร์เดอร์/พัสดุ/สถานะ → ตอบด้วยข้อมูลในบล็อกนั้นตรง ๆ (เลขคำสั่งซื้อ สถานะ สินค้า เลขพัสดุ)',
+      'มีหลายออร์เดอร์และลูกค้าไม่ได้ระบุ → ตอบถึงออร์เดอร์ล่าสุด แล้วบอกเลขออร์เดอร์กำกับไว้ด้วยเสมอ',
+      'ไม่มีบล็อกนี้ หรือไม่มีออร์เดอร์ตรงกับที่ลูกค้าถาม → อย่าเดา ให้ขอเลขคำสั่งซื้อ + ใส่ธง [[STAFF]]',
+      'ห้ามบอกวันที่ของจะถึงเอง (ข้อมูลไม่มี) บอกได้แค่สถานะกับเลขพัสดุที่มีในบล็อก',
+      '',
+      'ห้ามรับปากว่าจะส่งไฟล์ เอกสาร PDF อีเมล หรือลิงก์ใด ๆ ให้ลูกค้า ถ้าข้อมูลร้านไม่ได้เขียนไว้ว่าส่งแบบนั้น',
+      'เรื่องใบกำกับภาษี/ใบเสร็จ ให้ตอบตามข้อมูลร้านแบบเป๊ะ ๆ ห้ามเปลี่ยนวิธีจัดส่งเอกสารเอง',
       '',
       'ข้อความล้วน ห้าม markdown (**ตัวหนา** #) เพราะแชทแสดงเป็นดอกจันตรง ๆ',
       'คำลงท้ายต้องเป็นเพศเดียวกันทุกประโยคในข้อความเดียว ห้ามสลับ ครับ/ค่ะ ไปมา',
@@ -287,37 +335,182 @@ function renderItemCard(c) {
   return lines.length > 1 ? lines.join('\n') : '[ลูกค้าส่งการ์ดสินค้ามา]';
 }
 
-/** แปลง 1 ข้อความ Duoke เป็นข้อความสำหรับป้อน AI (คืน '' ถ้าไม่มีเนื้อความ) */
+/**
+ * การ์ดออร์เดอร์ที่ลูกค้ากดส่งมาจากหน้าคำสั่งซื้อ
+ * ข้อมูลบนการ์ดมีน้อย (เลขออร์เดอร์ + ชื่อสินค้า) — รายละเอียดจริงมาจาก orderContext
+ * ที่ watch.js ดึงจาก Duoke ให้ (ดู renderOrders)
+ */
+function renderOrderCard(c) {
+  const lines = ['[ลูกค้าส่งการ์ดคำสั่งซื้อมาในแชท — ลูกค้ากำลังถามถึงออร์เดอร์นี้]'];
+  const id = c.orderId ?? c.orderSn ?? c.orderNumber;
+  if (id) lines.push(`- เลขคำสั่งซื้อ: ${id}`);
+  if (c.productName ?? c.title) lines.push(`- สินค้า: ${String(c.productName ?? c.title).trim()}`);
+  if (c.skuValue) lines.push(`- ตัวเลือก: ${String(c.skuValue).trim()}`);
+  if (c.quantity) lines.push(`- จำนวน: ${c.quantity}`);
+  if (c.price) lines.push(`- ราคา: ${formatPrice(c.price, c.currency)}`);
+  if (c.status) lines.push(`- สถานะบนการ์ด: ${c.status}`);
+  return lines.length > 1 ? lines.join('\n') : '[ลูกค้าส่งการ์ดคำสั่งซื้อมา]';
+}
+
+/** URL รูปในข้อความ (ถ้าเป็นข้อความชนิดรูป) — ใช้ส่งให้ AI ดูรูปจริง */
+export function imageUrlOf(msg) {
+  const c = parseMessageContent(msg) || {};
+  const t = msg.messageType;
+  if (t === 'image' || t === 'file_image' || t === 'attachment_image') {
+    return c.imageUrl ?? c.url ?? c.fileUrl ?? null;
+  }
+  return null;
+}
+
+/**
+ * แปลง 1 ข้อความ Duoke เป็นข้อความสำหรับป้อน AI (คืน '' ถ้าไม่มีเนื้อความ)
+ *
+ * ชนิดข้อความจริงที่เจอในระบบ (ดูได้จาก chat.log บรรทัด "↳ raw"):
+ *   shopee : text · item · sticker · file_image · unknown (การ์ดสินค้ารุ่นใหม่ ห่อใน unknownData)
+ *   tiktok : text · goods_card · order_card · file_image
+ *   lazada : 1 = ข้อความ (มี translateTxt) · 10007 = การ์ดคำสั่งซื้อ
+ */
 function renderForAI(msg) {
   const c = parseMessageContent(msg) || {};
-  switch (msg.messageType) {
+  switch (String(msg.messageType)) {
     case 'text':
-    case 'attachment_text': return (c.text ?? '').trim();
-    case 'image': return '[ลูกค้าส่งรูปภาพมา]';
+    case 'attachment_text':
+    case '1': return (c.text ?? '').trim();           // lazada ส่ง type '1'
+    case 'image':
+    case 'file_image':
+    case 'attachment_image': return '[ลูกค้าส่งรูปภาพมา]';   // รูปจริงแนบเป็น image block ให้ AI ดู
     case 'video': return '[ส่งวิดีโอมา]';
     case 'sticker': return '[ส่งสติกเกอร์]';
-    case 'item':                              // shopee ใช้ 'item'
-    case 'product': return renderItemCard(c);  // เผื่อแพลตฟอร์มอื่นใช้ 'product'
-    case 'order': return '[ส่งการ์ดออร์เดอร์มา]';
+    case 'item':                                       // shopee
+    case 'goods_card':                                 // tiktok
+    case 'product': return renderItemCard(c);
+    case 'order':
+    case 'order_card':                                 // tiktok
+    case '10007': return renderOrderCard(c);           // lazada
     case 'file': return `[ส่งไฟล์: ${c.fileName ?? ''}]`;
+    case 'unknown': return renderUnknownCard(c);
     default: return (c.text ?? '').trim();
   }
 }
 
-/** messages (เก่า→ใหม่) → รูปแบบ Anthropic (ลูกค้า=user, ร้าน=assistant) */
+/**
+ * shopee ส่งการ์ดสินค้ารุ่นใหม่มาเป็น messageType 'unknown' โดยยัด JSON ซ้อนไว้ใน unknownData
+ * แกะออกมาให้ AI เห็นว่าลูกค้าถามสินค้าตัวไหน ไม่งั้นจะกลายเป็นข้อความว่าง
+ */
+function renderUnknownCard(c) {
+  try {
+    const outer = typeof c.unknownData === 'string' ? JSON.parse(c.unknownData) : c.unknownData;
+    const inner = typeof outer?.message === 'string' ? JSON.parse(outer.message) : outer?.message ?? outer;
+    const card = inner?.item_card_v2 ?? inner?.item_card ?? {};
+    const itemId = inner?.product_id ?? inner?.item_id;
+    const name = card.name ?? card.title ?? inner?.name;
+    if (!itemId && !name) return '';
+    return renderItemCard({
+      itemId,
+      title: name,
+      skuValue: card.model_name ?? card.sku_name,
+      // ราคาในการ์ดรุ่นนี้เป็นหน่วยย่อย (x100000) — หารกลับก่อนค่อยโชว์
+      price: card.display_price?.discount_price ? Number(card.display_price.discount_price) / 100000 : undefined,
+      currency: card.currency ?? 'THB',
+    });
+  } catch { return ''; }
+}
+
+/** ข้อความล้วนจาก content ที่อาจเป็น string หรือ array บล็อก (มีรูปปน) */
+const contentText = c => Array.isArray(c)
+  ? c.filter(b => b.type === 'text').map(b => b.text).join(' ')
+  : String(c ?? '');
+
+/**
+ * messages (เก่า→ใหม่) → รูปแบบ Anthropic (ลูกค้า=user, ร้าน=assistant)
+ * รูปที่ลูกค้าส่งมาจะแนบเป็น image block ให้ AI ดูรูปจริง (แนบแค่ AI_MAX_IMAGES รูปล่าสุด
+ * เพราะรูปหนึ่งกินราว 1,000-1,600 tokens — ย้อนหลังเยอะ ๆ ค่าใช้จ่ายพุ่ง)
+ */
 function toAnthropicMessages(messages) {
+  const recent = (messages || []).slice(-MAX_HISTORY);
+
+  const withImage = new Set();
+  if (READ_IMAGES) {
+    for (let i = recent.length - 1; i >= 0 && withImage.size < MAX_IMAGES; i--) {
+      const m = recent[i];
+      if (m.fromAccountType === 1 && imageUrlOf(m)) withImage.add(m.messageId);
+    }
+  }
+
   const out = [];
-  for (const m of messages.slice(-MAX_HISTORY)) {
+  for (const m of recent) {
     let text = renderForAI(m);
-    if (!text) continue;
+    const img = withImage.has(m.messageId) ? imageUrlOf(m) : null;
+    if (!text && !img) continue;
     // ข้อความของร้านที่ยาวเกินไปมักเป็น auto-reply สำเร็จรูป ตัดให้สั้นลง ไม่ต้องป้อนเต็ม ๆ
     if (m.fromAccountType !== 1 && text.length > MAX_MSG_CHARS) {
       text = text.slice(0, MAX_MSG_CHARS) + '…';
     }
-    out.push({ role: m.fromAccountType === 1 ? 'user' : 'assistant', content: text });
+    const role = m.fromAccountType === 1 ? 'user' : 'assistant';
+    out.push(img
+      ? { role, content: [
+          { type: 'image', source: { type: 'url', url: img } },
+          { type: 'text', text: text || '[ลูกค้าส่งรูปภาพมา]' },
+        ] }
+      : { role, content: text });
   }
   while (out.length && out[0].role !== 'user') out.shift();   // ต้องเริ่มด้วย user
   return out;
+}
+
+// ------------------------------------------------------- คำสั่งซื้อของลูกค้า
+
+// คำที่แปลว่าลูกค้ากำลังถามถึงออร์เดอร์ของตัวเอง → ค่อยไปดึงข้อมูลออร์เดอร์มาให้ AI
+const ORDER_WORDS = /ออเดอร์|ออร์เดอร์|order|คำสั่งซื้อ|เลขพัสดุ|เลขแทรค|แทรคกิ้ง|tracking|พัสดุ|ขนส่ง|จัดส่ง|ส่งของ|ส่งยัง|ยังไม่ได้รับ|ไม่ได้ของ|ของยัง|ถึงไหน|สถานะ|ตีกลับ|คืนของ|คืนเงิน|เคลม|ผิดรุ่น|ผิดสี|ของขาด|ไม่ครบ|ใบกำกับ|ใบเสร็จ|ใบเสด|ยกเลิก/i;
+
+/** ข้อความนี้ต้องใช้ข้อมูลออร์เดอร์ประกอบไหม (ข้อความล้วน หรือการ์ดออร์เดอร์) */
+export function needsOrderInfo(msg) {
+  const t = String(msg?.messageType ?? '');
+  if (t === 'order' || t === 'order_card' || t === '10007') return true;
+  const c = parseMessageContent(msg) || {};
+  return ORDER_WORDS.test(c.text ?? '');
+}
+
+const ORDER_STATUS_TH = {
+  UNPAID: 'ยังไม่ชำระเงิน', TO_PAY: 'ยังไม่ชำระเงิน',
+  READY_TO_SHIP: 'ชำระแล้ว รอร้านจัดส่ง', PROCESSED: 'ร้านเตรียมพัสดุแล้ว',
+  RETRY_SHIP: 'รอจัดส่งใหม่', SHIPPED: 'จัดส่งแล้ว ระหว่างขนส่ง',
+  TO_CONFIRM_RECEIVE: 'ถึงลูกค้าแล้ว รอกดรับสินค้า',
+  COMPLETED: 'สำเร็จแล้ว (ลูกค้ารับสินค้าแล้ว)', DELIVERED: 'ส่งถึงแล้ว',
+  CANCELLED: 'ยกเลิกแล้ว', TO_RETURN: 'อยู่ระหว่างคืนสินค้า', RETURNED: 'คืนสินค้าแล้ว',
+  IN_CANCEL: 'กำลังขอยกเลิก', INVALID: 'คำสั่งซื้อไม่สมบูรณ์',
+};
+const orderDate = t => (t ? new Date(t).toLocaleDateString('th-TH', { timeZone: 'Asia/Bangkok', day: '2-digit', month: '2-digit', year: '2-digit' }) : '');
+
+/**
+ * ออร์เดอร์จาก Duoke (api.getOrderList) → ข้อความสั้น ๆ ให้ AI ใช้ตอบ
+ * เอาเฉพาะช่องที่ลูกค้าถามจริง: เลขออร์เดอร์ สถานะ วันสั่ง ยอด สินค้า+ตัวเลือก+จำนวน เลขพัสดุ
+ */
+export function formatOrders(orders, max = 3) {
+  const list = (orders || []).slice(0, max);
+  if (!list.length) return '';
+  const out = [];
+  for (const o of list) {
+    const status = ORDER_STATUS_TH[o.platformOrderStatus] ?? o.platformOrderStatus ?? '-';
+    const head = [
+      `คำสั่งซื้อ ${o.orderNumber}`,
+      `สถานะ: ${status}`,
+      o.platformCreateTime ? `สั่งเมื่อ ${orderDate(o.platformCreateTime)}` : '',
+      o.amount != null ? `ยอดรวม ${formatPrice(o.amount, o.currency)}` : '',
+    ].filter(Boolean).join(' · ');
+    out.push(head);
+    for (const p of (o.productList || []).slice(0, 5)) {
+      out.push(`  - ${String(p.productName ?? '').trim()}` +
+        (p.variation || p.variationSku ? ` | ตัวเลือก: ${String(p.variation || p.variationSku).trim()}` : '') +
+        (p.quantity ? ` | ${p.quantity} ชิ้น` : ''));
+    }
+    const lg = o.logistics || {};
+    const track = Array.isArray(lg.trackingNumber) ? lg.trackingNumber.filter(Boolean).join(', ') : lg.trackingNumber;
+    if (lg.logisticsServiceName || track) {
+      out.push(`  ขนส่ง: ${[lg.logisticsServiceName, track ? `เลขพัสดุ ${track}` : ''].filter(Boolean).join(' · ')}`);
+    }
+  }
+  return out.join('\n');
 }
 
 // ------------------------------------------------------------------ main
@@ -330,11 +523,13 @@ function toAnthropicMessages(messages) {
  * @param {string}   [p.shopName]
  * @param {string}   [p.platform]
  * @param {string}   [p.buyerName]
- * @returns {Promise<{reply?:string, needsStaff:boolean, reason?:string}>}
+ * @returns {Promise<{reply?:string, needsStaff:boolean, reason?:string, skip?:boolean, unsafe?:boolean}>}
  *   reply      = ร่างคำตอบ (มีเสมอถ้าเป็นข้อความจากลูกค้าจริง)
- *   needsStaff = true ถ้าเคสละเอียดอ่อน ต้องให้เจ้าหน้าที่ตรวจก่อนตอบ
+ *   needsStaff = true ถ้าเคสละเอียดอ่อน ต้องให้เจ้าหน้าที่ตามไปตอบต่อ
+ *   skip       = true ถ้าร้านตอบคำถามนี้ไปแล้ว — ห้ามส่งอะไรซ้ำ
+ *   unsafe     = true ถ้าร่างมีข้อมูลที่ยืนยันไม่ได้ — ห้ามส่งร่างนี้ ให้ส่ง holdingMessage() แทน
  */
-export async function generateReply({ messages, shopName, platform, buyerName }) {
+export async function generateReply({ messages, shopName, platform, buyerName, orderContext }) {
   const dialogue = toAnthropicMessages(messages || []);
   if (!dialogue.length) return { needsStaff: true, reason: 'ไม่มีข้อความให้ตอบ' };
 
@@ -344,35 +539,54 @@ export async function generateReply({ messages, shopName, platform, buyerName })
   // (Claude รุ่นใหม่ไม่รับ prefill — ห้ามให้ messages จบด้วย role assistant)
   const trailingShop = [];
   while (dialogue.length && dialogue[dialogue.length - 1].role !== 'user') {
-    trailingShop.unshift(dialogue.pop().content);
+    trailingShop.unshift(contentText(dialogue.pop().content));
   }
   if (!dialogue.length) return { needsStaff: true, reason: 'ไม่มีข้อความของลูกค้า' };
   if (trailingShop.length) {
     dialogue.push({ role: 'user', content: `[ทางร้านตอบไปแล้วว่า: ${trailingShop.join(' / ')}]` });
   }
 
-  const text = await callLLM({
-    systemBlocks: buildSystemPrompt({ shopName, platform, buyerName }),
-    messages: dialogue,
-    maxTokens: MAX_TOKENS,
-  });
+  // ออร์เดอร์จริงของลูกค้าคนนี้ (watch.js ดึงจาก Duoke มาให้ตอนลูกค้าถามเรื่องออร์เดอร์)
+  // ใส่เป็นข้อความในบทสนทนา ไม่ใช่ system — เพื่อให้ตัวเลขในนั้น (เลขพัสดุ/ยอด) ผ่านการ์ดกันแต่งตัวเลข
+  if (orderContext) {
+    dialogue.push({
+      role: 'user',
+      content: '[ข้อมูลคำสั่งซื้อของลูกค้าคนนี้ จากระบบหลังร้าน — เป็นข้อมูลจริง ใช้ตอบได้เลย ' +
+        'ลูกค้าไม่เห็นข้อความนี้ ให้ตอบเป็นภาษาพูดปกติ]\n' + orderContext,
+    });
+  }
+
+  const systemBlocks = buildSystemPrompt({ shopName, platform, buyerName });
+  let text;
+  try {
+    text = await callLLM({ systemBlocks, messages: dialogue, maxTokens: MAX_TOKENS });
+  } catch (err) {
+    // รูปที่แนบไปอาจโหลดไม่ได้ (ลิงก์หมดอายุ/ชนิดไฟล์ไม่รองรับ/โมเดลอ่านรูปไม่ได้)
+    // → ลองใหม่แบบข้อความล้วน ดีกว่าปล่อยลูกค้าเงียบเพราะรูปเดียว
+    if (!dialogue.some(d => Array.isArray(d.content))) throw err;
+    const textOnly = dialogue.map(d => ({
+      role: d.role,
+      content: contentText(d.content) || '[ลูกค้าส่งรูปภาพมา แต่ระบบเปิดรูปไม่ได้]',
+    }));
+    text = await callLLM({ systemBlocks, messages: textOnly, maxTokens: MAX_TOKENS });
+  }
 
   if (!text) return { needsStaff: true, reason: 'AI ไม่ได้ร่างคำตอบ' };
 
   // แกะธงบรรทัดแรก แล้วตัดออกจากเนื้อความ (ค่าเริ่มต้น = STAFF เพื่อความปลอดภัย)
   const m = MARK_RE.exec(text);
   const flag = m ? m[1].toUpperCase() : 'STAFF';
-  if (flag === 'SKIP') return { needsStaff: false, reason: 'ร้านตอบคำถามนี้ไปแล้ว' };
+  if (flag === 'SKIP') return { needsStaff: false, skip: true, reason: 'ร้านตอบคำถามนี้ไปแล้ว' };
   const reply = text.replace(MARK_RE, '').trim();
   if (!reply) return { needsStaff: true, reason: 'AI ไม่ได้ร่างคำตอบ' };
 
   // การ์ดกันแต่งตัวเลข — ทดสอบแล้วทั้ง haiku และ sonnet ยังแต่ง "ส่งภายใน 2-3 วัน" เองได้
   // แม้สั่งห้ามใน prompt แล้ว (ความรู้ทั่วไปของโมเดลแรงกว่าคำสั่ง)
   // กติกา: ตัวเลขทุกตัวในคำตอบต้องปรากฏใน knowledge หรือในบทสนทนา ไม่งั้นบังคับให้เจ้าหน้าที่ตรวจ
-  const known = loadKnowledge() + '\n' + dialogue.map(d => d.content).join('\n');
+  const known = loadKnowledge() + '\n' + dialogue.map(d => contentText(d.content)).join('\n');
   const invented = [...new Set((reply.match(/\d+/g) ?? []).filter(n => !known.includes(n)))];
   if (invented.length) {
-    return { reply, needsStaff: true, reason: `มีตัวเลขที่ไม่มีในข้อมูล: ${invented.join(', ')}` };
+    return { reply, needsStaff: true, unsafe: true, reason: `มีตัวเลขที่ไม่มีในข้อมูล: ${invented.join(', ')}` };
   }
 
   return { reply, needsStaff: flag === 'STAFF' };
