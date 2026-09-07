@@ -211,6 +211,20 @@ export class DuokeRealtime extends EventEmitter {
   }
 
   /**
+   * ส่ง "การ์ดสินค้า" ให้ลูกค้า (แบบเดียวกับที่ลูกค้ากดส่งมาจากหน้าร้าน)
+   * itemId = รหัสสินค้าบนแพลตฟอร์ม เช่น 27715539310
+   */
+  async sendProduct({ shopId, conversationId, platform, itemId, puid, groupId }) {
+    const id = String(itemId);
+    return this.sendMessage({
+      shopId, conversationId, platform, puid, groupId,
+      contentType: 'product',
+      content: { itemId: id },
+      extraMeta: { productId: id },
+    });
+  }
+
+  /**
    * ส่งข้อความชนิดใด ๆ
    * ลำดับ: claimConversation → msg/create → msg/send
    */

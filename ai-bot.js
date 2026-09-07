@@ -40,6 +40,10 @@ const __dirname = path.dirname(fileURLToPath(import.meta.url));
 //   [[SKIP]]  = ร้านตอบคำถามนั้นครบไปแล้ว ไม่ต้องตอบซ้ำ
 const MARK_RE = /\[\[\s*(AUTO|STAFF|SKIP)\s*\]\]/i;
 
+// AI สั่งให้ส่ง "การ์ดสินค้า" ตามหลังข้อความได้ ด้วย [[SEND_ITEM:<รหัสสินค้า>]]
+// รหัสต้องมีอยู่จริงในคลังสินค้าเท่านั้น ไม่งั้นทิ้ง (กัน AI แต่งรหัสขึ้นมาเอง)
+const SEND_ITEM_RE = /\[\[\s*SEND_ITEM\s*:\s*(\d{5,20})\s*\]\]/i;
+
 // ข้อความ "ตอบเบื้องต้น" สำเร็จรูป — ใช้เมื่อไม่มีร่างที่ส่งให้ลูกค้าได้จริง
 // (ร่างมีตัวเลขที่ยืนยันไม่ได้ / AI ร่างไม่ได้-พลาด / โหมดคิวรอคนตอบ) เพื่อไม่ให้ลูกค้าเงียบ
 // ตั้ง AI_HOLDING_MESSAGE ใน .env เพื่อเปลี่ยนข้อความ · ใส่ค่าว่างเพื่อปิด
@@ -51,6 +55,24 @@ export function holdingMessage() {
   return (process.env.AI_HOLDING_MESSAGE ?? HOLDING_MESSAGE).trim();
 }
 
+// ลูกค้าเปิดแชทมาแต่ไม่ได้ส่งอะไรที่ตอบได้ (ข้อความว่าง / ชนิดที่อ่านไม่ออก)
+// → ชวนให้พิมพ์คำถามมา ดีกว่าปล่อยเงียบหรือส่งข้อความ "ขอตรวจสอบก่อน" ที่ไม่ตรงเรื่อง
+// ตั้ง AI_ASK_MESSAGE ใน .env เพื่อเปลี่ยนข้อความ · ใส่ค่าว่างเพื่อปิด
+const ASK_MESSAGE = 'สวัสดีครับ ลูกค้าต้องการสอบถามด้านใด สามารถถามมาได้เลยครับ';
+
+/** ข้อความชวนถาม เมื่อลูกค้าไม่ได้ส่งอะไรที่ตอบได้ ('' = ปิด ไม่ส่ง) */
+export function askMessage() {
+  return (process.env.AI_ASK_MESSAGE ?? ASK_MESSAGE).trim();
+}
+
+/** คืนผลลัพธ์แบบ "ชวนให้ลูกค้าถามมา" (ถ้าปิดข้อความไว้ ก็ไม่ตอบเหมือนเดิม) */
+function askBack(reason) {
+  const msg = askMessage();
+  return msg
+    ? { reply: msg, needsStaff: false, reason }
+    : { needsStaff: true, reason };
+}
+
 // เลือกเจ้าของ AI: 'anthropic' (Claude, ค่าเริ่มต้น) หรือ 'openai' (GPT)
 const PROVIDER = (process.env.AI_PROVIDER || 'anthropic').toLowerCase();
 const MAX_TOKENS = Number(process.env.AI_MAX_TOKENS || 1024);
@@ -60,7 +82,8 @@ function modelName() {
   if (process.env.AI_MODEL) return process.env.AI_MODEL;
   return PROVIDER === 'openai' ? 'gpt-4o-mini' : 'claude-haiku-4-5';
 }
-const MAX_HISTORY = Number(process.env.AI_MAX_HISTORY || 10);   // กี่ข้อความล่าสุดที่ป้อนให้ AI
+// ต้องเห็นบริบทย้อนหลังพอ ไม่งั้นข้อความสั้น ๆ อย่าง "5*8" หรือ "เอาอันนี้" จะตีความไม่ออก
+const MAX_HISTORY = Number(process.env.AI_MAX_HISTORY || 20);   // กี่ข้อความล่าสุดที่ป้อนให้ AI
 // ให้ AI "ดูรูป" ที่ลูกค้าส่งมาจริง ๆ (ต้องใช้โมเดลที่อ่านรูปได้ — claude ทุกตัว / gpt-4o ขึ้นไป)
 const READ_IMAGES = (process.env.AI_READ_IMAGES ?? 'true') !== 'false';
 const MAX_IMAGES = Number(process.env.AI_MAX_IMAGES || 3);      // แนบกี่รูปล่าสุด (รูปละ ~1-1.6k tokens)
@@ -72,7 +95,9 @@ const MAX_MSG_CHARS = Number(process.env.AI_MAX_MSG_CHARS || 220);
 //   ⚠ แต่ละโมเดลมีขั้นต่ำที่แคชได้ ถ้า prompt สั้นกว่านั้นจะไม่แคชเงียบ ๆ (ไม่มี error):
 //     claude-haiku-4-5 = 4096 tokens · claude-sonnet-5 = 1024 · claude-opus-5 = 512
 //   เช็คว่าแคชติดไหมดูที่ lastUsage().cacheRead — ถ้าเป็น 0 ตลอด แปลว่าไม่ติด
-const CACHE_TTL = process.env.AI_CACHE_TTL || '5m';
+//   ค่าเริ่มต้น '1h' เพราะแชทร้านมีช่วงเงียบเกิน 5 นาทีบ่อย ถ้าใช้ 5m แคชจะหมดอายุแล้ว
+//   ต้องเขียนใหม่ (~0.28 บาท/ครั้ง) ส่วน 1h เขียนแพงกว่าครั้งเดียวแต่อยู่ยาว คุ้มกว่ามาก
+const CACHE_TTL = process.env.AI_CACHE_TTL || '1h';
 const CACHE_CONTROL = CACHE_TTL === '1h'
   ? { type: 'ephemeral', ttl: '1h' }
   : { type: 'ephemeral' };
@@ -86,6 +111,114 @@ const KNOWLEDGE_DIR = process.env.AI_KNOWLEDGE_DIR
   : path.join(__dirname, 'knowledge');
 const KNOWLEDGE_EXT = ['.txt', '.md', '.csv', '.json', '.text'];
 const SKIP_FILES = new Set(['readme.md']);   // ไม่เอาไฟล์อธิบายไปปนกับข้อมูลจริง
+
+// ---------------------------------------------- ★ คลังสินค้า (โหลดเฉพาะที่ต้องใช้) ★
+// knowledge/products/ มีสินค้า 687 รายการ = หลายแสนโทเคน ยัดเข้า prompt ทุกข้อความไม่ไหว
+// จึงโหลดเฉพาะตัวที่เกี่ยวกับคำถามนั้นจริง ๆ:
+//   - ลูกค้าส่งการ์ดสินค้า → เปิดไฟล์ รายละเอียด/<itemId>.md ตรง ๆ (ชื่อไฟล์ = itemId)
+//   - ลูกค้าพิมพ์ชื่อสินค้า → ค้นจาก catalog.tsv ในเครื่อง (ไม่เสียเงิน ไม่เรียก API)
+const PRODUCTS_DIR = path.join(KNOWLEDGE_DIR, 'products');
+const DETAIL_DIR = path.join(PRODUCTS_DIR, 'รายละเอียด');
+const CATALOG_FILE = path.join(PRODUCTS_DIR, 'catalog.tsv');
+const MAX_DETAIL_FILES = Number(process.env.AI_MAX_PRODUCT_FILES || 2);
+// ไฟล์รายละเอียดส่วนใหญ่ ~420 ตัวอักษร แต่มีหางยาวถึง 5,500 (คำโฆษณาซ้ำ ๆ ของผู้ขาย)
+// ตัดที่ 1,200 ครอบคลุม 90% ของไฟล์แบบไม่เสียเนื้อหา และกันไฟล์ยาวผิดปกติกินโทเคน
+const MAX_DETAIL_CHARS = Number(process.env.AI_MAX_PRODUCT_CHARS || 1200);
+
+/** อ่านรายละเอียดสินค้าตาม itemId — คืน '' ถ้าไม่มีไฟล์ */
+export function loadProductDetail(itemId) {
+  if (!/^\d{1,20}$/.test(String(itemId ?? ''))) return '';   // กัน path traversal
+  try {
+    const body = fs.readFileSync(path.join(DETAIL_DIR, `${itemId}.md`), 'utf8').trim();
+    return body.length > MAX_DETAIL_CHARS ? body.slice(0, MAX_DETAIL_CHARS) + '\n…(ตัดท้าย)' : body;
+  } catch { return ''; }
+}
+
+// ---- ไฟล์หัวข้อ: knowledge/หัวข้อ/*.md ----
+// ข้อมูลก้อนใหญ่ที่ลูกค้าถามเป็นครั้งคราว (ตารางจำนวนบรรจุ, สเปกยี่ห้อ) ถ้ายัดไว้ใน
+// system prompt จะจ่ายทุกข้อความทั้งที่ใช้จริงไม่กี่ครั้ง จึงโหลดเฉพาะตอนที่ลูกค้าถามถึง
+// บรรทัดแรกของไฟล์ต้องเป็น "keywords: คำ1, คำ2, ..." — เจอคำไหนในข้อความลูกค้าก็โหลดไฟล์นั้น
+const TOPIC_DIR = path.join(KNOWLEDGE_DIR, 'หัวข้อ');
+let _topics = null;
+
+function loadTopics() {
+  if (_topics) return _topics;
+  _topics = [];
+  try {
+    for (const f of fs.readdirSync(TOPIC_DIR)) {
+      if (!KNOWLEDGE_EXT.includes(path.extname(f).toLowerCase())) continue;
+      const body = fs.readFileSync(path.join(TOPIC_DIR, f), 'utf8');
+      const m = /^keywords:\s*(.+)$/im.exec(body);
+      if (!m) continue;                       // ไม่มีบรรทัด keywords = ข้าม
+      _topics.push({
+        file: f,
+        keys: m[1].split(',').map(s => norm(s)).filter(s => s.length >= 2),
+        text: body.replace(/^keywords:.*$/im, '').trim(),
+      });
+    }
+  } catch { /* ไม่มีโฟลเดอร์ = ไม่มีหัวข้อ */ }
+  return _topics;
+}
+
+/** หาไฟล์หัวข้อที่ตรงกับคำถามลูกค้า — คืน '' ถ้าไม่ตรงอะไรเลย */
+function matchTopics(text) {
+  const q = norm(text);
+  if (q.length < 2) return '';
+  return loadTopics()
+    .filter(t => t.keys.some(k => q.includes(k)))
+    .map(t => t.text)
+    .join('\n\n');
+}
+
+let _catalog = null;
+/** โหลด catalog.tsv → [{id, name, cat, sub, brand, opts}] (แคชไว้ในหน่วยความจำ) */
+function loadCatalog() {
+  if (_catalog) return _catalog;
+  try {
+    _catalog = fs.readFileSync(CATALOG_FILE, 'utf8')
+      .split(/\r?\n/)
+      .filter(l => l && !l.startsWith('#') && !l.startsWith('id\t'))
+      .map(l => {
+        const [id, name, cat, sub, brand, opts] = l.split('\t');
+        return { id, name: name ?? '', cat: cat ?? '', sub: sub ?? '', brand: brand ?? '', opts: opts ?? '' };
+      })
+      .filter(r => r.id);
+  } catch { _catalog = []; }
+  return _catalog;
+}
+
+// คำที่เจอในทุกประโยคจนไม่ช่วยแยกสินค้า — ตัดทิ้งก่อนค้น
+const STOPWORDS = /(สวัสดี|ครับ|ค่ะ|คะ|ขอ|อยาก|สอบถาม|รบกวน|ไหม|มั้ย|หน่อย|ราคา|เท่าไหร่|เท่าไร|ยังไง|อย่างไร|มีขาย|สินค้า|ตัวนี้|อันนี้|นะ|ๆ|\s)/g;
+
+/**
+ * ค้นสินค้าจากชื่อที่ลูกค้าพิมพ์ — ทำในเครื่อง ไม่เสียเงิน
+ * ภาษาไทยไม่มีเว้นวรรคระหว่างคำ จึงใช้วิธีตัด n-gram แล้วนับว่าตรงกับชื่อสินค้ากี่ชิ้น
+ */
+const norm = s => String(s ?? '').toLowerCase().replace(/\s+/g, '');
+
+export function searchProducts(text, limit = 5) {
+  const q = norm(String(text ?? '').replace(STOPWORDS, ' '));
+  if (q.length < 3) return [];
+  const grams = new Set();
+  for (let len = Math.min(q.length, 10); len >= 3; len--) {
+    for (let i = 0; i + len <= q.length; i++) grams.add(q.slice(i, i + len));
+  }
+  const rows = loadCatalog();
+  const scored = [];
+  for (const r of rows) {
+    // ตัดช่องว่างฝั่งชื่อสินค้าด้วย ไม่งั้น "ท่อPVC" จะจับกับ "ท่อ PVC" ไม่ติด
+    const hay = norm(`${r.name} ${r.sub} ${r.brand}`);
+    let best = 0, score = 0;
+    for (const g of grams) {
+      if (!hay.includes(g)) continue;
+      score += g.length;
+      if (g.length > best) best = g.length;
+    }
+    // ต้องมีท่อนที่ตรงยาวอย่างน้อย 4 ตัวอักษร ไม่งั้นเป็นการบังเอิญตรงสั้น ๆ เช่น "4นิ้ว"
+    if (best >= 5) scored.push({ ...r, score, best });
+  }
+  return scored.sort((a, b) => b.best - a.best || b.score - a.score).slice(0, limit);
+}
 
 let _kbCache = { sig: null, text: '' };
 
@@ -184,6 +317,23 @@ function getOpenAI() {
 let _lastUsage = null;
 export function lastUsage() { return _lastUsage; }
 
+// เนื้อผลค้นเว็บครั้งล่าสุด — ใช้เป็น "แหล่งอ้างอิง" ให้การ์ดกันแต่งตัวเลข
+let _lastSources = '';
+
+// ค้นเว็บ: เปิดให้ AI หาข้อมูลสินค้าทั่วไปจากอินเทอร์เน็ตเมื่อไม่มีในโฟลเดอร์ knowledge
+// ⚠ คิดเงินแยกต่างหากจาก token (ราว 0.33 บาท/การค้น 1 ครั้ง) — จำกัดด้วย AI_WEB_SEARCH_MAX
+// ปิดไว้เป็นค่าเริ่มต้น — คลังสินค้าในเครื่อง (knowledge/products/) ตอบได้เกือบหมดแล้ว
+// และถูกกว่าค้นเว็บราว 10 เท่า เปิดเมื่อต้องการความรู้นอกเหนือจากของร้านจริง ๆ
+const WEB_SEARCH = (process.env.AI_WEB_SEARCH ?? 'false') === 'true';
+const WEB_SEARCH_MAX = Number(process.env.AI_WEB_SEARCH_MAX || 1);
+
+/** รุ่นใหม่ใช้ web_search ตัวที่กรองผลได้ ส่วน haiku/รุ่นเก่ารองรับแค่ตัวพื้นฐาน */
+function webSearchType() {
+  return /opus-(5|4-[678])|sonnet-(5|4-6)/.test(modelName())
+    ? 'web_search_20260209'
+    : 'web_search_20250305';
+}
+
 /** เรียก LLM ตาม provider ที่เลือก → คืนข้อความล้วน */
 async function callLLM({ systemBlocks, messages, maxTokens }) {
   if (PROVIDER === 'openai') {
@@ -206,20 +356,43 @@ async function callLLM({ systemBlocks, messages, maxTokens }) {
     return (res.choices?.[0]?.message?.content ?? '').trim();
   }
   // Anthropic (Claude): system เป็น array บล็อก (มี cache_control สำหรับ prompt caching)
-  const res = await getAnthropic().messages.create({
-    model: modelName(),
-    max_tokens: maxTokens,
-    system: systemBlocks,
-    messages,
-  });
-  const u = res.usage ?? {};
-  _lastUsage = {
-    in: u.input_tokens ?? 0,               // ไม่ได้แคช (คิดราคาเต็ม)
-    cacheWrite: u.cache_creation_input_tokens ?? 0,  // เขียนแคช (1.25 เท่า)
-    cacheRead: u.cache_read_input_tokens ?? 0,       // อ่านจากแคช (0.1 เท่า)
-    out: u.output_tokens ?? 0,
-  };
-  return (res.content || []).filter(b => b.type === 'text').map(b => b.text).join('').trim();
+  const client = getAnthropic();
+  const req = { model: modelName(), max_tokens: maxTokens, system: systemBlocks, messages: [...messages] };
+  if (WEB_SEARCH) req.tools = [{ type: webSearchType(), name: 'web_search', max_uses: WEB_SEARCH_MAX }];
+
+  const total = { in: 0, cacheWrite: 0, cacheRead: 0, out: 0, searches: 0 };
+  const texts = [];
+  _lastSources = '';
+
+  // ค้นเว็บทำงานฝั่ง Anthropic แต่ถ้าใช้เวลานานจะหยุดกลางคันด้วย stop_reason: 'pause_turn'
+  // ต้องส่งเทิร์นนั้นกลับไปให้ทำต่อ ไม่งั้นได้คำตอบที่ถูกตัดกลางคันแบบเงียบ ๆ
+  for (let round = 0; round < 4; round++) {
+    const res = await client.messages.create(req);
+    const u = res.usage ?? {};
+    total.in += u.input_tokens ?? 0;
+    total.cacheWrite += u.cache_creation_input_tokens ?? 0;
+    total.cacheRead += u.cache_read_input_tokens ?? 0;
+    total.out += u.output_tokens ?? 0;
+    total.searches += u.server_tool_use?.web_search_requests ?? 0;
+
+    for (const b of res.content ?? []) {
+      if (b.type === 'text') texts.push(b.text);
+      // โมเดลชอบพิมพ์เกริ่นก่อนค้นเว็บ เช่น "ให้ค้นหาเพื่อตอบชัดเจน" ซึ่งไม่ควรหลุดถึงลูกค้า
+      // → เจอการเรียกเครื่องมือเมื่อไหร่ ทิ้งข้อความก่อนหน้าทั้งหมด เอาเฉพาะคำตอบสุดท้าย
+      else if (b.type === 'server_tool_use') texts.length = 0;
+      // เก็บที่มาของผลค้นหาไว้ให้การ์ดกันแต่งตัวเลขตรวจ
+      else if (b.type === 'web_search_tool_result' && Array.isArray(b.content)) {
+        texts.length = 0;
+        for (const r of b.content) _lastSources += ` ${r.title ?? ''} ${r.url ?? ''} ${r.page_age ?? ''}`;
+      }
+    }
+
+    if (res.stop_reason !== 'pause_turn') break;
+    req.messages.push({ role: 'assistant', content: res.content });
+  }
+
+  _lastUsage = total;
+  return texts.join('').trim();
 }
 
 /** โหมด "ให้ Claude Code / คน ตอบผ่านคิวไฟล์" (ไม่เรียก API เสียเงิน) */
@@ -249,11 +422,40 @@ export function buildSystemPrompt({ shopName, platform, buyerName }) {
     stable = process.env.AI_SYSTEM_PROMPT;
   } else {
     stable = [
-      'คุณเป็นผู้ช่วยตอบแชทลูกค้าของร้านค้าออนไลน์ ตอบภาษาไทย สุภาพ เป็นกันเอง',
+      'คุณคือเจ้าหน้าที่แอดมินของร้านค้าออนไลน์ กำลังตอบแชทลูกค้าเอง ไม่ใช่ผู้ช่วยหรือบอท',
+      'เขียนให้เหมือนคนพิมพ์ตอบจริง ๆ ภาษาไทย สุภาพ เป็นกันเอง กระชับ',
+      'ห้ามบอกว่าตัวเองเป็น AI ห้ามพูดว่า "ทางเราจะให้เจ้าหน้าที่ติดต่อกลับ" ในเรื่องที่ตอบเองได้',
+      'พูดแทนร้านว่า "ทางร้าน" หรือ "เรา" ได้เลย',
+      '',
+      'อ่านบทสนทนาทั้งหมดตั้งแต่ต้นก่อนตอบ อย่าดูแค่ข้อความสุดท้าย',
+      'ลูกค้ามักพิมพ์สั้น ๆ ต่อจากเรื่องที่คุยค้างไว้ ต้องเดาความหมายจากบริบทก่อนหน้า เช่น',
+      '  พิมพ์ "5*8" หรือ "3.5x5.5" = ขนาดของสินค้าที่คุยกันอยู่ ไม่ใช่ตัวเลขลอย ๆ',
+      '  พิมพ์ "เอาอันนี้" "อันไหนดี" "แล้วสีอื่นล่ะ" = หมายถึงสินค้าในการ์ดหรือที่พูดถึงก่อนหน้า',
+      '  พิมพ์ตัวเลขเฉย ๆ = จำนวนที่ต้องการ หรือขนาด แล้วแต่เรื่องที่คุยค้างไว้',
+      'ถ้าลูกค้าส่งหลายข้อความรวดเดียว ให้ตอบรวมทุกข้อความในคำตอบเดียว อย่าตอบแค่ข้อความสุดท้าย',
+      'ถ้าตีความไม่ออกจริง ๆ ให้ถามกลับสั้น ๆ ว่าหมายถึงอะไร อย่าเดาแล้วตอบผิดเรื่อง',
+      '',
+      'ห้ามตอบซ้ำของเดิม — ดูข้อความที่ร้านตอบไปแล้วในบทสนทนาก่อนเสมอ:',
+      '  ถ้าเคยอธิบายเรื่องนั้นไปแล้วและลูกค้ายังถามเรื่องเดิม แปลว่าคำตอบเดิมยังไม่ตรงใจ',
+      '  ห้ามพิมพ์ข้อความเดิมซ้ำ ให้เปลี่ยนวิธี เช่น ถามกลับว่าติดตรงไหน หรือให้ข้อมูลมุมใหม่',
+      '  ถ้าลูกค้าถามเรื่องใหม่ต่อจากเดิม ให้ตอบเฉพาะส่วนที่ยังไม่ได้ตอบ ไม่ต้องเท้าความทั้งหมด',
+      '  ทักทาย "สวัสดีครับ" ใช้เฉพาะข้อความแรกของบทสนทนา ถ้าคุยกันอยู่แล้วไม่ต้องทักซ้ำ',
+      '',
+      'ส่งการ์ดสินค้าให้ลูกค้าได้ด้วย: ถ้าลูกค้าถามถึงสินค้าตัวใดตัวหนึ่ง และในบรรทัด',
+      '[ข้อมูลสินค้าจากคลังของร้าน] มี "รหัสสินค้า" ของตัวนั้น ให้พิมพ์ [[SEND_ITEM:รหัสสินค้า]]',
+      'ต่อท้ายคำตอบ ระบบจะส่งการ์ดสินค้าให้ลูกค้ากดสั่งซื้อได้เลย',
+      'ใช้ได้เฉพาะรหัสที่ปรากฏในข้อมูลที่ให้มาเท่านั้น ห้ามแต่งรหัสเอง ห้ามส่งเกิน 1 ใบต่อข้อความ',
+      'ถ้าลูกค้าถามกว้าง ๆ ยังไม่เจาะจงสินค้า ไม่ต้องส่ง',
       '',
       'รูปแบบ: บรรทัดแรกใส่ธงเดียว แล้วขึ้นบรรทัดใหม่เขียนร่างคำตอบถึงลูกค้า ไม่เกิน 3 ประโยค',
-      '  [[AUTO]]  = มีข้อมูลตอบได้ชัด (ทักทาย วิธีสั่งซื้อ เวลาทำการ ข้อมูลที่มีในข้อมูลร้าน ราคาบนการ์ด)',
-      '  [[STAFF]] = ไม่มีข้อมูล หรือเคสละเอียดอ่อน (ต่อรอง เคลม คืนเงิน ปัญหาจัดส่ง สต็อก สเปกที่ไม่มีในข้อมูล)',
+      '  [[AUTO]]  = ตอบจบได้เองในข้อความเดียว ไม่ต้องมีใครตามต่อ — ใช้เป็นค่าเริ่มต้น',
+      '              (ทักทาย ข้อมูลสินค้า วิธีสั่งซื้อ เวลาทำการ เงื่อนไขใบกำกับ สถานะออร์เดอร์',
+      '               เลขพัสดุ ค่าส่งที่ให้ลูกค้าดูหน้าชำระเงิน และการบอกตรง ๆ ว่าร้านไม่มีข้อมูลนั้น)',
+      '  [[STAFF]] = เฉพาะเรื่องที่ต้องให้คนตัดสินใจหรือลงมือทำจริงเท่านั้น ใช้ให้น้อย:',
+      '              เคลม · คืนเงิน · คืนสินค้า · ของหาย · ของไม่ครบ · ส่งผิด · สินค้าชำรุด ·',
+      '              ยกเลิกออร์เดอร์ · ขอส่วนลด-ต่อรองราคา · ลูกค้าร้องเรียนหรือไม่พอใจ',
+      'ถ้าไม่เข้า 10 เรื่องข้างบน ให้ใช้ [[AUTO]] แม้จะไม่มีข้อมูลก็ตาม —',
+      'การตอบว่า "เรื่องนี้ทางร้านไม่ได้ระบุไว้ รบกวนดูที่หน้าสินค้า" ก็ถือเป็นคำตอบที่จบแล้ว',
       'ต้องร่างคำตอบให้เสมอทั้งสองแบบ และร่างจะถูกส่งถึงลูกค้าจริงทันที',
       'จึงต้องเขียนเป็นข้อความที่ส่งได้เลย ห้ามเขียนโน้ตถึงเจ้าหน้าที่หรือเว้นช่องให้เติม',
       'ธง STAFF = ส่งร่างนี้เป็น "คำตอบเบื้องต้น" ก่อน แล้วเจ้าหน้าที่จะตามไปตอบต่อ',
@@ -264,15 +466,32 @@ export function buildSystemPrompt({ shopName, platform, buyerName }) {
       'ถ้าเป็นข้อความอัตโนมัติ (ทักทาย ขอให้รอ นอกเวลาทำการ) ให้ตอบคำถามลูกค้าตามปกติ',
       'ถ้าร้านตอบคำถามนั้นครบถ้วนแล้วจริง ๆ ให้ตอบว่า [[SKIP]] อย่างเดียว ไม่ต้องร่างคำตอบ',
       '',
-      'ห้ามแต่งข้อมูล ทุกข้อเท็จจริงต้องมาจากข้อมูลร้านด้านล่าง หรือจากการ์ดสินค้าที่ลูกค้าส่งมาเท่านั้น',
-      'ห้ามเดาสเปก วัสดุ ขนาด วิธีใช้ คุณภาพ จากชื่อสินค้า (ห้ามเขียนว่าแข็งแรงทนทาน ถ้าข้อมูลไม่ได้เขียนไว้)',
-      'ห้ามระบุตัวเลขที่ไม่มีในข้อมูลร้านเด็ดขาด โดยเฉพาะ ระยะเวลาจัดส่ง ค่าส่ง ราคา สต็อก เวลาทำการ',
-      'ระยะเวลารับประกัน (ห้ามเดาว่า "ส่งภายใน 2-3 วัน" ถ้าข้อมูลร้านไม่ได้เขียนไว้)',
-      'ไม่มีข้อมูล = ทวนเท่าที่รู้ + ขอเช็คให้สักครู่ + ใส่ธง [[STAFF]]',
+      'ข้อมูล 2 ประเภท แยกให้ขาด:',
+      '',
+      '(1) เรื่องที่เป็นคำสัญญาของร้าน — ราคา สต็อก ค่าส่ง ระยะเวลาจัดส่ง เวลาทำการ การรับประกัน',
+      'เคลม คืนเงิน เงื่อนไขใบกำกับภาษี ส่วนลด',
+      'ต้องมาจากข้อมูลร้านด้านล่าง หรือการ์ดสินค้าที่ลูกค้าส่งมาเท่านั้น ห้ามค้นเว็บ ห้ามเดาเด็ดขาด',
+      'ไม่มีในข้อมูลร้าน = บอกว่าขอเช็คให้สักครู่ + ใส่ธง [[STAFF]] ห้ามตอบเป็นตัวเลขเอง',
+      '',
+      '(2) ความรู้ทั่วไปเกี่ยวกับตัวสินค้า — วัสดุคืออะไร ใช้งานยังไง ต่างกันยังไง ดูแลรักษายังไง',
+      'ขนาดมาตรฐานของอุปกรณ์ประเภทนั้น เทียบรุ่น',
+      'ดูบรรทัด [ข้อมูลสินค้าจากคลังของร้าน] ในบทสนทนาก่อนเสมอ — เป็นข้อมูลจริงของสินค้าตัวที่ลูกค้าถาม',
+      'ถ้ามีคำตอบอยู่ในนั้นแล้ว ให้ตอบจากตรงนั้น ห้ามค้นเว็บซ้ำ',
+      'ถ้าไม่มีทั้งในคลังและในข้อมูลร้าน และมีเครื่องมือ web_search ให้ค้นก่อนตอบ อย่าตอบจากความจำ',
+      'เพราะความจำอาจคลาดเคลื่อน แล้วค่อยเอาผลค้นหามาเรียบเรียงตอบลูกค้า',
+      'ต้องพูดในเชิงข้อมูลทั่วไป เช่น "อวนไนลอนโดยทั่วไปจะ..." ห้ามพูดเหมือนเป็นสเปกที่ร้านรับรอง',
+      'ถ้าค้นแล้วยังไม่ชัดเจน อย่าเดา ให้ใส่ธง [[STAFF]]',
+      '',
+      'ห้ามเดาสเปก วัสดุ ขนาด คุณภาพ จากชื่อสินค้าลอย ๆ โดยไม่มีทั้งข้อมูลร้านและผลค้นหา',
       '',
       'การ์ดสินค้า (ข้อความขึ้นต้นว่า [ลูกค้าส่งการ์ดสินค้า]) = ลูกค้าสนใจตัวนั้น แม้ไม่ได้พิมพ์อะไรมา',
       'ห้ามตอบกลาง ๆ ว่าสอบถามด้านใด ให้ทวน ชื่อ+ตัวเลือก+ราคา จากการ์ด แล้วถามต่อว่าต้องการกี่ชิ้น',
-      'ราคาบนการ์ดคือราคาจริงบนหน้าร้าน ใช้ยืนยันได้ · หลายใบ = กำลังเทียบ ให้พูดถึงทุกใบ',
+      'ส่งการ์ดมาหลายใบ = กำลังเทียบสินค้า ให้พูดถึงทุกใบ',
+      '',
+      'ห้ามบอกราคาสินค้าเป็นตัวเลขเด็ดขาด แม้ลูกค้าจะถามตรง ๆ ก็ตาม',
+      'เพราะราคาที่ลูกค้าแต่ละคนจ่ายจริงไม่เท่ากัน ขึ้นกับส่วนลดและคูปองที่แต่ละคนถืออยู่',
+      'ให้ตอบว่าราคาที่แสดงบนหน้าสินค้า/ในตะกร้าของลูกค้าเองคือราคาจริงที่ต้องจ่าย',
+      '(ยอดของคำสั่งซื้อที่ลูกค้าสั่งไปแล้ว บอกได้ เพราะเป็นยอดที่จ่ายจริงไปแล้ว)',
       '',
       'รูปที่ลูกค้าส่งมา: ดูรูปแล้วบอกสิ่งที่เห็นจริง ๆ ห้ามเดาสิ่งที่มองไม่ชัด',
       'รูปสินค้า/หน้าจอสินค้า → ทวนว่าเห็นอะไร แล้วถามให้ชัดว่าต้องการสอบถามเรื่องใด',
@@ -289,6 +508,7 @@ export function buildSystemPrompt({ shopName, platform, buyerName }) {
       'เรื่องใบกำกับภาษี/ใบเสร็จ ให้ตอบตามข้อมูลร้านแบบเป๊ะ ๆ ห้ามเปลี่ยนวิธีจัดส่งเอกสารเอง',
       '',
       'ข้อความล้วน ห้าม markdown (**ตัวหนา** #) เพราะแชทแสดงเป็นดอกจันตรง ๆ',
+      'ห้ามเขียนเป็นข้อ 1. 2. 3. ให้เขียนเป็นประโยคต่อเนื่อง',
       'คำลงท้ายต้องเป็นเพศเดียวกันทุกประโยคในข้อความเดียว ห้ามสลับ ครับ/ค่ะ ไปมา',
       '(ใช้ตามที่ระบุในข้อมูลร้าน ถ้าไม่ระบุให้ใช้ ครับ ทั้งหมด) · เรียกลูกค้าว่า "ลูกค้า" เท่านั้น ห้ามเรียกน้อง/พี่',
       'ขึ้นต้นด้วยคำทักทายให้ครบคำ (สวัสดีครับ) ห้ามขึ้นต้นด้วยคำลงท้ายลอย ๆ',
@@ -328,7 +548,8 @@ function renderItemCard(c) {
   const lines = ['[ลูกค้าส่งการ์ดสินค้ามาในแชท — นี่คือสินค้าที่ลูกค้ากำลังสนใจ]'];
   if (c.title)    lines.push(`- ชื่อสินค้า: ${String(c.title).trim()}`);
   if (c.skuValue) lines.push(`- ตัวเลือกที่ลูกค้าเลือก: ${String(c.skuValue).trim()}`);
-  if (c.price)    lines.push(`- ราคาบนการ์ด: ${formatPrice(c.price, c.currency)}`);
+  // ไม่ส่งราคาให้ AI เห็นเลย — ราคาที่ลูกค้าแต่ละคนจ่ายจริงต่างกันตามส่วนลด/คูปองที่ถืออยู่
+  // ถ้าให้เห็นแล้วสั่งห้ามพูด โมเดลก็มักหลุดพูดอยู่ดี ตัดออกตั้งแต่ต้นทางชัวร์กว่า
   if (c.quantity) lines.push(`- จำนวน: ${c.quantity}`);
   if (Number(c.isPreOrder)) lines.push('- เป็นสินค้าพรีออเดอร์');
   if (c.itemId)   lines.push(`- รหัสสินค้า: ${c.itemId}`);
@@ -513,6 +734,61 @@ export function formatOrders(orders, max = 3) {
   return out.join('\n');
 }
 
+// เรื่องที่ต้องให้เจ้าหน้าที่ตามต่อเสมอ ไม่ว่า AI จะติดธงว่าอะไร
+// (haiku ไม่ทำตามกฎใน prompt ทุกครั้ง — บังคับในโค้ดชัวร์กว่า)
+// สั้นและเจาะจง เพื่อไม่ให้ดักคำถามทั่วไปจนเจ้าหน้าที่ท่วม
+const MUST_STAFF_RE = new RegExp([
+  'เคลม', 'คืนเงิน', 'คืนสินค้า', 'รีฟัน', 'refund',
+  'ของหาย', 'ไม่ได้รับของ', 'ของไม่ครบ', 'ได้ไม่ครบ', 'ส่งผิด', 'ผิดรุ่น', 'ผิดสี', 'ผิดขนาด',
+  'ชำรุด', 'แตกหัก', 'ของเสีย', 'ใช้ไม่ได้',
+  'ยกเลิกออร์เดอร์', 'ยกเลิกคำสั่งซื้อ',
+  'ลดราคา', 'ลดได้', 'ต่อรอง', 'ขอส่วนลด', 'ถูกกว่านี้', 'แถม',
+  'ร้องเรียน', 'ไม่พอใจ', 'แย่มาก', 'โกง',
+].join('|'), 'i');
+
+// ------------------------------------------------- แท็กใบกำกับภาษี / สลิปออนไลน์
+
+// ลูกค้า "ขอ" ใบกำกับ/ใบเสร็จ — ไม่ใช่แค่พูดถึงลอย ๆ
+const INVOICE_ASK_RE = /(ใบกำกับ|ใบเสร็จ|ใบเสด|ใบกำกับภาษี|vat|แวท|ภาษี)/i;
+const INVOICE_THRESHOLD = Number(process.env.AI_INVOICE_THRESHOLD || 1000);
+
+/**
+ * ลูกค้าขอใบกำกับไหม และยอดถึงเกณฑ์ไหม → บอกว่าควรติดแท็กอะไร
+ *
+ * ยอดเงินยึด "ออร์เดอร์จริงใน Duoke" เท่านั้น ไม่ใช้ตัวเลขที่ลูกค้าพิมพ์
+ * (ลูกค้ามักพิมพ์ราคาสินค้าชิ้นเดียว ไม่ใช่ยอดรวมของออร์เดอร์)
+ * ไม่มีออร์เดอร์ = ไม่ติดแท็ก (ติดผิดแล้วเจ้าหน้าที่ทำงานผิดตาม เสียหายกว่าไม่ติด)
+ *
+ * ถ้าลูกค้าส่งการ์ดออร์เดอร์มาด้วย จะยึดออร์เดอร์ใบนั้น ไม่งั้นใช้ใบล่าสุด
+ *
+ * @returns {{kind:'invoice'|'slip', amount:number, from:string}|null}
+ */
+export function invoiceTagFor({ messages, orders }) {
+  const msgs = messages || [];
+  const asked = msgs
+    .filter(m => m.fromAccountType === 1)
+    .map(m => renderForAI(m))
+    .some(t => t && INVOICE_ASK_RE.test(t));
+  if (!asked) return null;
+
+  const list = (orders || []).filter(o => Number.isFinite(Number(o?.amount)) && Number(o.amount) > 0);
+  if (!list.length) return null;               // ไม่มียอดจากออร์เดอร์ → ไม่เดา
+
+  // ลูกค้าส่งการ์ดออร์เดอร์มา = ระบุใบที่ต้องการชัดเจน ให้ยึดใบนั้น
+  const cardIds = msgs
+    .filter(m => m.fromAccountType === 1 && /^(order|order_card|10007)$/.test(String(m.messageType)))
+    .map(m => String(parseMessageContent(m)?.orderId ?? ''))
+    .filter(Boolean);
+  const picked = list.find(o => cardIds.includes(String(o.orderId ?? o.orderNumber ?? ''))) ?? list[0];
+
+  const amount = Number(picked.amount);
+  return {
+    kind: amount >= INVOICE_THRESHOLD ? 'invoice' : 'slip',
+    amount,
+    from: `ออร์เดอร์ ${picked.orderNumber ?? picked.orderId ?? ''}`.trim(),
+  };
+}
+
 // ------------------------------------------------------------------ main
 
 /**
@@ -529,9 +805,72 @@ export function formatOrders(orders, max = 3) {
  *   skip       = true ถ้าร้านตอบคำถามนี้ไปแล้ว — ห้ามส่งอะไรซ้ำ
  *   unsafe     = true ถ้าร่างมีข้อมูลที่ยืนยันไม่ได้ — ห้ามส่งร่างนี้ ให้ส่ง holdingMessage() แทน
  */
+// ข้อความรับคำ/ขอบคุณ/สติกเกอร์ ที่ไม่ได้ถามอะไร — ไม่ต้องเรียก AI ให้เปลืองเงิน
+// เงื่อนไขเข้มไว้ก่อน: ต้องสั้นมาก ไม่มีเครื่องหมายคำถาม ไม่มีตัวเลข และตรงกับรายการนี้เท่านั้น
+const SMALLTALK_RE = /^(ครับ|ค่ะ|คะ|จ้า|จ้าา|โอเค|โอเคครับ|โอเคค่ะ|ok|okay|ได้ครับ|ได้ค่ะ|ขอบคุณ|ขอบคุณครับ|ขอบคุณค่ะ|ขอบคุณมากครับ|ขอบคุณมากค่ะ|thanks|thank you|ไม่เป็นไร|ไม่เป็นไรครับ|ไม่เป็นไรค่ะ|รับทราบ|รับทราบครับ|รับทราบค่ะ|\[ส่งสติกเกอร์\])[\s.!ๆๆ๐-๙]*$/i;
+const SKIP_SMALLTALK = (process.env.AI_SKIP_SMALLTALK ?? 'true') !== 'false';
+
+/** ข้อความนี้เป็นแค่คำรับ/ขอบคุณ ไม่ต้องให้ AI ร่างคำตอบไหม */
+function isSmallTalk(text) {
+  const t = String(text ?? '').trim().replace(/[\u{1F300}-\u{1FAFF}\u{2600}-\u{27BF}]/gu, '').trim();
+  if (!t) return true;                       // ส่งมาแต่อิโมจิ
+  if (t.length > 25 || /[?？]/.test(t)) return false;
+  return SMALLTALK_RE.test(t);
+}
+
+/**
+ * เลือกข้อมูลสินค้าที่เกี่ยวกับคำถามนี้จากคลังในเครื่อง
+ *   1) ลูกค้าส่งการ์ดสินค้ามา → เปิดไฟล์ตาม itemId ตรง ๆ (แม่นที่สุด ไม่ต้องเดา)
+ *   2) ไม่มีการ์ด → ค้นชื่อจาก catalog.tsv ด้วยข้อความล่าสุดของลูกค้า
+ * คืน '' ถ้าไม่เจออะไรเลย (ปล่อยให้ค้นเว็บ/ส่งเจ้าหน้าที่ต่อไป)
+ */
+function buildProductContext(rawMessages, dialogue) {
+  const ids = [];
+  for (const m of rawMessages) {
+    if (m.messageType !== 'item' && m.messageType !== 'product') continue;
+    const id = parseMessageContent(m)?.itemId;
+    if (id && !ids.includes(String(id))) ids.push(String(id));
+  }
+
+  const parts = [];
+
+  // ไฟล์หัวข้อ (ตารางจำนวนบรรจุ ฯลฯ) — ดูจากทุกข้อความของลูกค้าในห้อง ไม่ใช่แค่ข้อความล่าสุด
+  // เพราะลูกค้ามักถามชื่อสินค้าก่อน แล้วค่อยถามต่อว่า "ขนาด 6x11 กี่ใบ"
+  const askText = dialogue.filter(d => d.role === 'user').map(d => contentText(d.content)).join(' ');
+  const topic = matchTopics(askText);
+  if (topic) parts.push(topic);
+
+  if (ids.length) {
+    for (const id of ids.slice(-MAX_DETAIL_FILES)) {
+      const detail = loadProductDetail(id);
+      if (detail) parts.push(detail);
+    }
+    if (parts.length) return parts.join('\n\n---\n\n');
+  }
+
+  // ไม่มีการ์ด (หรือการ์ดไม่มีไฟล์) → ค้นจากข้อความล่าสุดของลูกค้า
+  const lastAsk = contentText(dialogue[dialogue.length - 1]?.content ?? '');
+  const joined = () => parts.join('\n\n');
+  if (/^\[/.test(lastAsk)) return joined();      // เป็นบันทึกบริบท ไม่ใช่คำถามลูกค้า
+  // เคสร้องเรียน/ปัญหาออร์เดอร์ ไม่ได้ถามหาสินค้า — ค้นไปก็ได้ของไม่เกี่ยว
+  // (เช่น "ไม่ได้รับของ" ไปตรงกับ "ตะปู…ได้รับ" เปลืองโทเคนเปล่าและอาจทำให้ตอบหลุดประเด็น)
+  if (/ไม่ได้รับ|ยังไม่ได้|ยังไม่ถึง|ของหาย|เคลม|คืนเงิน|คืนสินค้า|ส่งผิด|ชำรุด|แตกหัก|พัสดุ|ยกเลิก|refund/i.test(lastAsk)) return joined();
+
+  const hits = searchProducts(lastAsk, 5);
+  if (!hits.length) return joined();
+
+  const detail = loadProductDetail(hits[0].id);
+  if (detail) parts.push(detail);
+  if (hits.length > 1) {
+    parts.push('รายการอื่นในร้านที่ชื่อใกล้เคียง (ยังไม่มีรายละเอียด ถ้าลูกค้าสนใจตัวไหนให้ถามกลับ):\n'
+      + hits.slice(1).map(h => `- ${h.name}${h.opts ? ` · ตัวเลือก: ${h.opts}` : ''}`).join('\n'));
+  }
+  return parts.join('\n\n');
+}
+
 export async function generateReply({ messages, shopName, platform, buyerName, orderContext }) {
   const dialogue = toAnthropicMessages(messages || []);
-  if (!dialogue.length) return { needsStaff: true, reason: 'ไม่มีข้อความให้ตอบ' };
+  if (!dialogue.length) return askBack('ไม่มีข้อความให้ตอบ');
 
   // Shopee/TikTok ยิงข้อความ auto-reply ของร้านทันทีหลังลูกค้าพิมพ์ ทำให้ข้อความท้ายสุด
   // กลายเป็นของร้าน (ทั้งที่ลูกค้าเพิ่งถาม) — เดิมบอทจะข้ามทิ้งทั้งห้อง
@@ -541,7 +880,7 @@ export async function generateReply({ messages, shopName, platform, buyerName, o
   while (dialogue.length && dialogue[dialogue.length - 1].role !== 'user') {
     trailingShop.unshift(contentText(dialogue.pop().content));
   }
-  if (!dialogue.length) return { needsStaff: true, reason: 'ไม่มีข้อความของลูกค้า' };
+  if (!dialogue.length) return askBack('ไม่มีข้อความของลูกค้า');
   if (trailingShop.length) {
     dialogue.push({ role: 'user', content: `[ทางร้านตอบไปแล้วว่า: ${trailingShop.join(' / ')}]` });
   }
@@ -553,6 +892,28 @@ export async function generateReply({ messages, shopName, platform, buyerName, o
       role: 'user',
       content: '[ข้อมูลคำสั่งซื้อของลูกค้าคนนี้ จากระบบหลังร้าน — เป็นข้อมูลจริง ใช้ตอบได้เลย ' +
         'ลูกค้าไม่เห็นข้อความนี้ ให้ตอบเป็นภาษาพูดปกติ]\n' + orderContext,
+    });
+  }
+
+  // ลูกค้าพิมพ์แค่ "ครับ" / "ขอบคุณค่ะ" / สติกเกอร์ → ไม่ต้องเรียก AI (ประหยัดเต็ม 100%)
+  if (SKIP_SMALLTALK && !orderContext) {
+    const last = contentText(dialogue[dialogue.length - 1]?.content ?? '');
+    // ยกเว้นเฉพาะบันทึกบริบทที่โค้ดใส่เอง ส่วน [ส่งสติกเกอร์] ถือเป็นข้อความลูกค้าจริง
+    if (!/^\[(ทางร้าน|ข้อมูล)/.test(last) && isSmallTalk(last)) {
+      _lastUsage = { in: 0, cacheWrite: 0, cacheRead: 0, out: 0, searches: 0 };
+      // skip:true = ห้ามส่งข้อความตอบเบื้องต้น และห้ามติดแท็กรอเจ้าหน้าที่
+      return { needsStaff: false, skip: true, reason: 'เป็นคำรับ/ขอบคุณ ไม่ต้องตอบ (ไม่ได้เรียก AI)' };
+    }
+  }
+
+  // ข้อมูลสินค้าจากคลังในเครื่อง — ถูกกว่าค้นเว็บหลายสิบเท่าและเป็นของร้านจริง
+  const productInfo = buildProductContext(messages || [], dialogue);
+  if (productInfo) {
+    dialogue.push({
+      role: 'user',
+      content: '[ข้อมูลสินค้าจากคลังของร้าน — เป็นข้อมูลจริง ใช้ตอบได้เลย ' +
+        'ลูกค้าไม่เห็นข้อความนี้ ให้ตอบเป็นภาษาพูดปกติ ' +
+        'ถ้ารายการที่เจอไม่ตรงกับที่ลูกค้าถาม อย่าเดา ให้บอกว่าขอเช็คให้]\n' + productInfo,
     });
   }
 
@@ -571,25 +932,61 @@ export async function generateReply({ messages, shopName, platform, buyerName, o
     text = await callLLM({ systemBlocks, messages: textOnly, maxTokens: MAX_TOKENS });
   }
 
-  if (!text) return { needsStaff: true, reason: 'AI ไม่ได้ร่างคำตอบ' };
+  if (!text) return askBack('AI ไม่ได้ร่างคำตอบ');
 
   // แกะธงบรรทัดแรก แล้วตัดออกจากเนื้อความ (ค่าเริ่มต้น = STAFF เพื่อความปลอดภัย)
   const m = MARK_RE.exec(text);
   const flag = m ? m[1].toUpperCase() : 'STAFF';
   if (flag === 'SKIP') return { needsStaff: false, skip: true, reason: 'ร้านตอบคำถามนี้ไปแล้ว' };
-  const reply = text.replace(MARK_RE, '').trim();
-  if (!reply) return { needsStaff: true, reason: 'AI ไม่ได้ร่างคำตอบ' };
+  // แกะคำสั่งส่งการ์ดสินค้าออกจากเนื้อความ แล้วตรวจว่ารหัสมีอยู่จริงในคลัง
+  const sendMatch = SEND_ITEM_RE.exec(text);
+  let sendItemId = null;
+  if (sendMatch) {
+    const id = sendMatch[1];
+    if (loadProductDetail(id) || loadCatalog().some(r => r.id === id)) sendItemId = id;
+  }
+
+  const reply = text.replace(MARK_RE, '').replace(SEND_ITEM_RE, '').trim();
+  if (!reply) return askBack('AI ไม่ได้ร่างคำตอบ');
 
   // การ์ดกันแต่งตัวเลข — ทดสอบแล้วทั้ง haiku และ sonnet ยังแต่ง "ส่งภายใน 2-3 วัน" เองได้
   // แม้สั่งห้ามใน prompt แล้ว (ความรู้ทั่วไปของโมเดลแรงกว่าคำสั่ง)
   // กติกา: ตัวเลขทุกตัวในคำตอบต้องปรากฏใน knowledge หรือในบทสนทนา ไม่งั้นบังคับให้เจ้าหน้าที่ตรวจ
-  const known = loadKnowledge() + '\n' + dialogue.map(d => contentText(d.content)).join('\n');
-  const invented = [...new Set((reply.match(/\d+/g) ?? []).filter(n => !known.includes(n)))];
+  // ตัวเลขที่มาจากผลค้นเว็บถือว่ามีที่มา ไม่นับเป็นการแต่งขึ้นเอง
+  const known = loadKnowledge() + '\n' + _lastSources + '\n'
+    + dialogue.map(d => contentText(d.content)).join('\n');
+  // เทียบ "ทั้งตัวเลข" ไม่ใช่ substring — ไม่งั้นเลข 1/2/3 จะไปเจอใน "7-14" หรือ "2.5" ได้หมด
+  // แล้วคำตอบที่แต่งขึ้น เช่น "ส่ง 1-2 วัน" จะหลุดผ่านทั้งที่ข้อมูลร้านไม่มีเขียนไว้
+  // จุดทศนิยมนับรวมในตัวเลข ส่วนคอมมาไม่นับ (ไม่งั้น "1.5,1.7,2.0" จะกลายเป็นก้อนเดียว)
+  // ฝั่งข้อมูลเก็บทั้งแบบมีคอมมาและตัดคอมมา เพื่อให้ "3,200" จับคู่กับ "3200" ได้
+  const NUM_RE = /\d+(?:\.\d+)?/g;
+  const knownNums = new Set([
+    ...(known.match(NUM_RE) ?? []),
+    ...(known.replace(/,/g, '').match(NUM_RE) ?? []),
+  ]);
+  // เลขที่ตามด้วยคำนับโครงสร้างประโยค ("2 วิธี", "3 ข้อ") ไม่ใช่ข้อมูลร้าน ไม่ต้องตรวจ
+  const cleanReply = reply.replace(/,/g, '')
+    .replace(/\d+\s*(วิธี|แบบ|อย่าง|ข้อ|ประการ|ช่องทาง|ทางเลือก|ขั้นตอน)/g, '')
+    .replace(/(วิธี|แบบ|อย่าง|ข้อ|ขั้นตอน|ทาง)\s*ที่\s*\d+/g, '');
+  const invented = [...new Set(cleanReply.match(NUM_RE) ?? [])]
+    .filter(n => !knownNums.has(n));
   if (invented.length) {
     return { reply, needsStaff: true, unsafe: true, reason: `มีตัวเลขที่ไม่มีในข้อมูล: ${invented.join(', ')}` };
   }
 
-  return { reply, needsStaff: flag === 'STAFF' };
+  // เรื่องเงิน/ของเสีย/ร้องเรียน ต้องมีคนตามต่อเสมอ แม้ AI จะบอกว่าตอบจบเองได้
+  // ดูเฉพาะสิ่งที่ลูกค้าพิมพ์จริง ไม่รวมบริบทที่โค้ดแทรกเข้าไป (ขึ้นต้นด้วย [)
+  // ไม่งั้นชื่อสินค้าอย่าง "กาวตราช้าง 1แถม1" จะไปตรงกับคำว่า "แถม" แล้วเด้งหาเจ้าหน้าที่
+  const buyerSaid = dialogue
+    .filter(d => d.role === 'user')
+    .map(d => contentText(d.content))
+    .filter(t => !/^\s*\[/.test(t))
+    .join(' ');
+  if (MUST_STAFF_RE.test(buyerSaid)) {
+    return { reply, sendItemId, needsStaff: true, reason: 'เรื่องที่ต้องให้เจ้าหน้าที่ตามต่อ' };
+  }
+
+  return { reply, sendItemId, needsStaff: flag === 'STAFF' };
 }
 
 export default { isEnabled, autoSend, generateReply };

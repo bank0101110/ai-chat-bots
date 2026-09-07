@@ -14,6 +14,7 @@
     "inbox": "node inbox.js",
     "example": "node example.js",
     "ai-test": "node ai-test.js",
+    "learn": "node learn-replies.js",
     "relogin": "node duoke-session.js --force"
   },
   "dependencies": {

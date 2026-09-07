@@ -46,7 +46,17 @@ const SHOW_CONVERSATIONS = process.env.SHOW_CONVERSATIONS === 'true';
 const AUTO_TAG = (process.env.AUTO_TAG ?? 'true') !== 'false';
 const AUTO_TAG_NAME = process.env.AUTO_TAG_NAME || 'รอเจ้าหน้าที่';
 const AUTO_TAG_AI_NAME = process.env.AUTO_TAG_AI_NAME || 'AI ตอบ';
+// ตามเก็บห้องที่ "ยังไม่อ่าน" — ลูกค้าทักมาก่อนบอทออนไลน์ แชทเด้งจับไม่ได้
+const CATCHUP = (process.env.CATCHUP_UNREAD ?? 'true') !== 'false';
+const CATCHUP_LIMIT = Number(process.env.CATCHUP_LIMIT || 20);      // ตอบได้สูงสุดกี่ห้องต่อรอบ
+const CATCHUP_DAYS = Number(process.env.CATCHUP_DAYS || 3);         // ย้อนหลังไม่เกินกี่วัน
+const CATCHUP_EVERY_MIN = Number(process.env.CATCHUP_EVERY_MIN || 15); // วนซ้ำทุกกี่นาที (0=ครั้งเดียว)
+
+// แท็กเคสใบกำกับภาษี — ติดต่อเมื่อลูกค้า "ขอ" ใบกำกับเท่านั้น แล้วแยกตามยอดสั่งซื้อ
+const TAG_INVOICE_NAME = process.env.AUTO_TAG_INVOICE_NAME || 'green';            // ยอดถึงเกณฑ์
+const TAG_SLIP_NAME = process.env.AUTO_TAG_SLIP_NAME || 'ขอสลิปออนไลน์';          // ยอดไม่ถึง
 // ห้องเดิมส่ง "คำตอบเบื้องต้น" ซ้ำได้เร็วสุดกี่นาที (ลูกค้ามักพิมพ์รัวหลายข้อความติดกัน)
+const CARD_COOLDOWN_MS = Number(process.env.AI_CARD_COOLDOWN_MIN || 60) * 60_000;
 const HOLDING_COOLDOWN_MS = Number(process.env.AI_HOLDING_COOLDOWN_MIN || 30) * 60_000;
 const LOG_FILE = process.env.LOG_FILE ? path.join(__dirname, process.env.LOG_FILE) : null;
 // ในไฟล์ log เก็บข้อความเต็มเสมอ (ไม่ตัด …) ส่วนบนจอย่อให้อ่านง่ายตาม LOG_CONSOLE_MAX
@@ -211,12 +221,16 @@ const isAuthError = err => err?.code === 401 || err?.code === 403 || /401|403/.t
 
 const convCache = new Map();        // conversationId -> conversation object
 const seenMessageIds = new Set();   // กัน log ซ้ำ
+const answeredMsgId = new Map();    // conversationId → messageId ล่าสุดของลูกค้าที่ตอบไปแล้ว (กันตอบซ้ำ)
+const sentCards = new Map();        // conversationId → Map(itemId → เวลาที่ส่ง) กันส่งการ์ดสินค้าซ้ำ
 const holdingSentAt = new Map();    // conversationId -> เวลาที่ส่ง "คำตอบเบื้องต้น" ล่าสุด (กันส่งซ้ำ)
 let api = null;
 let rt = null;
 let stopping = false;
 let autoTagId = null;               // tagId ของ "รอเจ้าหน้าที่" (resolve ตอน start)
 let aiTagId = null;                 // tagId ของ "AI ตอบ" (resolve ตอน start ถ้าเปิด AI)
+let invoiceTagId = null;            // tagId ของแท็กใบกำกับ (ยอดถึงเกณฑ์)
+let slipTagId = null;               // tagId ของแท็กสลิปออนไลน์ (ยอดไม่ถึง)
 let myPuid = null;                  // puid ของบัญชี — ใช้ตอนส่งข้อความกลับ
 
 // ---------------------------------------------------------------- ขั้นที่ 1: login
@@ -338,15 +352,153 @@ async function orderContextFor(e, info, messages) {
   }
 }
 
+/**
+ * ลูกค้าขอใบกำกับภาษี → ติดแท็กตามยอดสั่งซื้อ
+ *   ยอด >= เกณฑ์ (1000)  → แท็ก "green"           (ออกใบกำกับได้)
+ *   ยอดต่ำกว่าเกณฑ์       → แท็ก "ขอสลิปออนไลน์"
+ * ติดต่อเมื่อลูกค้า "ขอ" เท่านั้น และต้องรู้ยอดจริง ไม่รู้ยอด = ไม่ติด (กันติดผิด)
+ */
+async function tagInvoiceCase(e, info, messages) {
+  if (!AUTO_TAG || (!invoiceTagId && !slipTagId)) return;
+  if (!ai.invoiceTagFor) return;
+
+  // ยิง API ดึงออร์เดอร์เฉพาะตอนลูกค้าพูดถึงใบกำกับจริง ๆ จะได้ไม่เปลืองทุกข้อความ
+  const asked = messages.some(m => m.fromAccountType === 1
+    && /ใบกำกับ|ใบเสร็จ|ใบเสด|vat|แวท/i.test(parseMessageContent(m)?.text ?? ''));
+  if (!asked) return;
+
+  // ยอดจากออร์เดอร์จริงใน Duoke — แม่นกว่าตัวเลขที่ลูกค้าพิมพ์
+  let orders = [];
+  const buyerId = info.buyerId ?? info.dkConversationVO?.buyerId;
+  if (buyerId) {
+    try {
+      const res = await api.getOrderList({ shopId: e.shopId, buyerId, platform: e.platform, pageSize: 5 });
+      orders = res?.list ?? [];
+    } catch { /* ดึงไม่ได้ก็ใช้ยอดที่ลูกค้าพิมพ์แทน */ }
+  }
+
+  const hit = ai.invoiceTagFor({ messages, orders });
+  if (!hit) return;
+
+  const tagId = hit.kind === 'invoice' ? invoiceTagId : slipTagId;
+  const label = hit.kind === 'invoice' ? TAG_INVOICE_NAME : TAG_SLIP_NAME;
+  if (!tagId) return;
+  log(`${C.gray}          ↳ 🧾 ขอใบกำกับ · ยอด ${hit.amount} (${hit.from}) → ${C.reset}${label}`);
+  await addConversationTag(e, info, tagId, label);
+}
+
+/** ติดแท็กตามผลที่ AI จัดการห้องนั้น (ใช้ร่วมกันทั้งแชทเด้งและตอนตามเก็บห้องค้าง) */
+async function applyOutcomeTag(e, info, outcome) {
+  if (!AUTO_TAG) return;
+  // ไม่ต้องตอบ (ร้านตอบไปแล้ว / ลูกค้าพิมพ์แค่ "ครับ" / สติกเกอร์) → ไม่ยุ่งกับแท็กเลย
+  // ปล่อยแท็กเดิมของห้องไว้อย่างที่เจ้าหน้าที่ตั้งไว้ ห้ามติด "รอเจ้าหน้าที่" ทับเคสที่จบแล้ว
+  if (outcome === 'skipped') return;
+  if (outcome === 'sent' || outcome === 'suggested') {
+    await addConversationTag(e, info, aiTagId, AUTO_TAG_AI_NAME);
+    await removeConversationTag(e, info, autoTagId, AUTO_TAG_NAME);
+  } else {
+    // AI ข้าม/เคสละเอียดอ่อน/ปิด/พลาด → ให้เจ้าหน้าที่ตอบ
+    await addConversationTag(e, info, autoTagId, AUTO_TAG_NAME);
+  }
+}
+
+/**
+ * ตามเก็บห้องที่ "ยังไม่อ่าน" — ลูกค้าทักมาแล้วแต่ยังไม่มีใครตอบ
+ * แชทเด้ง (socket) จับได้เฉพาะข้อความที่เข้ามาตอนบอทออนไลน์ ห้องที่ค้างมาก่อนหน้าจะตกหล่น
+ * รันตอนเริ่มระบบ และซ้ำทุก CATCHUP_EVERY_MIN นาที
+ */
+async function catchUpUnread() {
+  if (!CATCHUP) return;
+  let rooms = [];
+  try {
+    const res = await api.queryConversationList({
+      shopIdList: shops.map(s => s.id ?? s.shopId), size: 200, offset: 0,
+    });
+    rooms = (res?.list ?? []).filter(c => Number(c.unReadCount) > 0);
+  } catch (err) {
+    if (isAuthError(err)) relogin();
+    log(`${C.gray}${ts()}${C.reset} ${C.yellow}⚠️  ดึงห้องค้างไม่สำเร็จ:${C.reset} ${err.message}`);
+    return;
+  }
+
+  // เอาเฉพาะที่ยังใหม่พอ — ห้องค้างข้ามเดือนไม่ควรเด้งไปตอบตอนนี้
+  const cutoff = Date.now() - CATCHUP_DAYS * 86400_000;
+  const todo = rooms
+    .filter(c => !c.lastMessageTimestamp || c.lastMessageTimestamp >= cutoff)
+    .sort((a, b) => (b.lastMessageTimestamp ?? 0) - (a.lastMessageTimestamp ?? 0))
+    .slice(0, CATCHUP_LIMIT);
+
+  if (!todo.length) return;
+  log(`${C.gray}${ts()}${C.reset} 📬 ${C.bold}ตามเก็บห้องค้าง ${todo.length} ห้อง${C.reset}${C.gray} (ยังไม่อ่านทั้งหมด ${rooms.length})${C.reset}`);
+
+  for (const c of todo) {
+    const e = { shopId: c.shopId, conversationId: c.conversationId, platform: c.platform };
+    try {
+      const info = await getConvInfo(e);
+      const pc = PLATFORM_COLOR[c.platform] ?? C.gray;
+      log(`${C.gray}${ts()}${C.reset} 📬 ${pc}${info.shopName ?? c.shopId}·${c.platform}${C.reset} ${C.bold}${C.cyan}${c.buyerNick ?? c.conversationId}${C.reset} ${C.gray}(ค้าง ${c.unReadCount} ข้อความ)${C.reset}`);
+      const outcome = await aiRespond(e, info);
+      await applyOutcomeTag(e, info, outcome);
+    } catch (err) {
+      if (isAuthError(err)) { relogin(); return; }
+      log(`${C.gray}          ↳ ${C.yellow}⚠️  ตามเก็บห้องนี้ไม่สำเร็จ:${C.reset} ${err.message}`);
+    }
+  }
+}
+
+/** ส่งการ์ดสินค้าตามหลังข้อความ (AI สั่งมาด้วย [[SEND_ITEM:...]] — รหัสผ่านการตรวจแล้ว) */
+async function sendProductCard(e, itemId) {
+  if (!itemId) return;
+
+  // ห้องเดิม การ์ดใบเดิม ไม่ส่งซ้ำภายในเวลาที่กำหนด (ลูกค้าเห็นไปแล้ว ส่งซ้ำรก)
+  const room = sentCards.get(e.conversationId) ?? new Map();
+  const last = room.get(itemId);
+  if (last && Date.now() - last < CARD_COOLDOWN_MS) {
+    log(`${C.gray}          ↳ 🛍  ${C.dim}การ์ด ${itemId} ส่งไปแล้วเมื่อกี้ ไม่ส่งซ้ำ${C.reset}`);
+    return;
+  }
+
+  try {
+    await rt.sendProduct({
+      shopId: e.shopId, conversationId: e.conversationId, platform: e.platform,
+      itemId, puid: myPuid,
+    });
+    room.set(itemId, Date.now());
+    sentCards.set(e.conversationId, room);
+    log(`${C.gray}          ↳ 🛍  ${C.green}ส่งการ์ดสินค้าแล้ว:${C.reset} ${itemId}`);
+  } catch (err) {
+    // ส่งการ์ดไม่ได้ไม่ใช่เรื่องคอขาดบาดตาย ข้อความหลักส่งไปแล้ว
+    log(`${C.gray}          ↳ 🛍  ${C.yellow}ส่งการ์ดสินค้าไม่สำเร็จ (${itemId}):${C.reset} ${err.message}`);
+  }
+}
+
 // ให้ AI ร่างคำตอบทุกข้อความ (จุดต่อ AI อยู่ที่ ai-bot.js)
 // จะ "log ร่างคำตอบก่อนเสมอ" แล้วค่อยให้ตัวเรียกจัดการแท็ก
-// คืนสถานะ: 'sent' | 'suggested' | 'staff' | 'declined' | 'disabled' | 'error'
+// คืนสถานะ: 'sent' | 'suggested' | 'staff' | 'skipped' | 'declined' | 'disabled' | 'error'
+//   'skipped' = ไม่ต้องตอบ (ร้านตอบไปแล้ว / ลูกค้าพิมพ์แค่คำรับ) → ตัวเรียกจะไม่แตะแท็กเลย
 async function aiRespond(e, info) {
   if (!ai.isEnabled()) return 'disabled';
   try {
     // ดึงประวัติล่าสุดเป็นบริบท (เก่า → ใหม่)
-    const hist = await api.getMessageList({ ...e, pageNo: 1, pageSize: 20 });
+    const hist = await api.getMessageList({ ...e, pageNo: 1, pageSize: 30 });
     const messages = (hist?.list ?? []).slice().reverse();
+
+    // กันตอบซ้ำ: ทั้ง "ตามเก็บห้องค้าง" และ "แชทเด้ง" อาจเข้าห้องเดียวกันห่างกันไม่กี่วินาที
+    // ถ้าข้อความล่าสุดของลูกค้ายังเป็นตัวเดิมที่ตอบไปแล้ว = ไม่มีอะไรใหม่ ไม่ต้องตอบอีก
+    const lastBuyerMsg = [...messages].reverse().find(m => m.fromAccountType === 1);
+    const lastId = lastBuyerMsg?.messageId ?? lastBuyerMsg?.id;
+    if (lastId && answeredMsgId.get(e.conversationId) === lastId) {
+      log(`${C.gray}          ↳ 🤖 ${C.dim}ตอบข้อความนี้ไปแล้ว ไม่ตอบซ้ำ${C.reset}`);
+      return 'skipped';
+    }
+    if (lastId) {
+      answeredMsgId.set(e.conversationId, lastId);
+      if (answeredMsgId.size > 2000) answeredMsgId.clear();
+    }
+
+    // เคสใบกำกับภาษี — ติดแท็กตามยอดสั่งซื้อ ทำก่อนเรียก AI เพราะเป็นกฎตายตัว
+    // ไม่เกี่ยวกับว่า AI จะตอบว่าอะไร และต้องทำงานในโหมดคิวไฟล์ด้วย
+    await tagInvoiceCase(e, info, messages);
 
     // โหมด claude-code: โยนคำถาม+บริบทลงคิวไฟล์ ให้ Claude Code/คน ตอบ (ไม่เรียก API)
     if (ai.isInboxMode()) {
@@ -378,13 +530,15 @@ async function aiRespond(e, info) {
     // โชว์ token ที่ใช้ไป — cacheR=0 ตลอด แปลว่า prompt caching ไม่ติด (ดู AI_CACHE_TTL ใน .env)
     const u = ai.lastUsage?.();
     if (u) {
-      log(`${C.gray}          ↳ 🎫 in=${u.in} cacheW=${u.cacheWrite} cacheR=${u.cacheRead} out=${u.out}${C.reset}`);
+      const web = u.searches ? ` ${C.yellow}ค้นเว็บ=${u.searches}${C.reset}${C.gray}` : '';
+      log(`${C.gray}          ↳ 🎫 in=${u.in} cacheW=${u.cacheWrite} cacheR=${u.cacheRead} out=${u.out}${web}${C.reset}`);
     }
 
-    // ร้านตอบคำถามนี้ครบไปแล้ว → เงียบไว้ ห้ามส่งอะไรซ้ำให้ลูกค้ารำคาญ
+    // ร้านตอบคำถามนี้ครบไปแล้ว (หรือลูกค้าพิมพ์แค่คำรับ) → เงียบไว้ทั้งข้อความและแท็ก
+    // คืน 'skipped' ไม่ใช่ 'declined' เพราะ 'declined' จะไปติดแท็ก "รอเจ้าหน้าที่" ทับเคสที่จบไปแล้ว
     if (r.skip) {
       log(`${C.gray}          ↳ 🤖 ${C.dim}AI ข้าม (${r.reason ?? 'ร้านตอบไปแล้ว'})${C.reset}`);
-      return 'declined';
+      return 'skipped';
     }
 
     // ไม่มีร่างคำตอบเลย → อย่างน้อยต้องตอบเบื้องต้นให้ลูกค้า แล้วให้เจ้าหน้าที่ตามต่อ
@@ -422,9 +576,11 @@ async function aiRespond(e, info) {
         text: r.reply, puid: myPuid,
       });
       logLong(`${C.gray}          ↳ 🤖 ${C.green}AI ตอบแล้ว:${C.reset} `, r.reply);
+      await sendProductCard(e, r.sendItemId);
       return 'sent';
     }
     logLong(`${C.gray}          ↳ 🤖 ${C.yellow}AI แนะนำตอบ${C.reset} (ยังไม่ส่ง — ตั้ง AI_AUTO_SEND=true เพื่อส่งจริง): `, r.reply);
+    if (r.sendItemId) log(`${C.gray}          ↳ 🛍  ${C.dim}(ถ้าเปิด auto-send จะส่งการ์ดสินค้า ${r.sendItemId} ตามไปด้วย)${C.reset}`);
     return 'suggested';
   } catch (err) {
     if (isAuthError(err)) { relogin(); return 'error'; }
@@ -487,14 +643,9 @@ function wireEvents() {
       if (sawBuyerMsg) {
         const outcome = await aiRespond(e, info);   // ข้างในจะ log คำตอบ/คำแนะนำก่อนคืนค่า
         if (AUTO_TAG) {
-          // AI มีคำตอบ (ตอบจริง 'sent' หรือ แนะนำ 'suggested') → AI จัดการได้
-          if (outcome === 'sent' || outcome === 'suggested') {
-            await addConversationTag(e, info, aiTagId, AUTO_TAG_AI_NAME);
-            await removeConversationTag(e, info, autoTagId, AUTO_TAG_NAME);
-          } else {
-            // AI ข้าม/เคสละเอียดอ่อน/ปิด/พลาด → ให้เจ้าหน้าที่ตอบ
-            await addConversationTag(e, info, autoTagId, AUTO_TAG_NAME);
-          }
+          // ไม่ต้องตอบ (ร้านตอบไปแล้ว / ลูกค้าพิมพ์แค่ "ครับ" / สติกเกอร์) → ไม่ยุ่งกับแท็กเลย
+          // ปล่อยแท็กเดิมของห้องไว้อย่างที่เจ้าหน้าที่ตั้งไว้ ห้ามติด "รอเจ้าหน้าที่" ทับเคสที่จบแล้ว
+          await applyOutcomeTag(e, info, outcome);
         }
       }
     } catch (err) {
@@ -565,6 +716,12 @@ if (AUTO_TAG) {
       aiTagId = await api.ensureTag({ tagName: AUTO_TAG_AI_NAME, tagColor: 'green' });
       if (!aiTagId) console.log(`${C.yellow}⚠️  หา/สร้างแท็ก “${AUTO_TAG_AI_NAME}” ไม่ได้${C.reset}`);
     }
+    // แท็กเคสใบกำกับ — ทั้งสองอันมีอยู่แล้วในบัญชี ensureTag จะเจอของเดิม ไม่สร้างซ้ำ
+    invoiceTagId = await api.ensureTag({ tagName: TAG_INVOICE_NAME, tagColor: 'green' });
+    slipTagId = await api.ensureTag({ tagName: TAG_SLIP_NAME, tagColor: 'green' });
+    if (!invoiceTagId || !slipTagId) {
+      console.log(`${C.yellow}⚠️  หาแท็กใบกำกับไม่ครบ (“${TAG_INVOICE_NAME}”/“${TAG_SLIP_NAME}”) — ข้ามการติดแท็กเคสใบกำกับ${C.reset}`);
+    }
   } catch (err) {
     console.log(`${C.yellow}⚠️  เตรียมแท็กไม่สำเร็จ: ${err.message} — ปิดการติดแท็กอัตโนมัติ${C.reset}`);
   }
@@ -585,6 +742,16 @@ if (ai.isEnabled()) {
 }
 console.log(C.dim + '─'.repeat(70) + C.reset);
 log(`${C.gray}${ts()}${C.reset} ✅ ${C.green}พร้อมรับแชท${C.reset} — Ctrl+C เพื่อออก`);
+
+// ตามเก็บห้องที่ค้างอยู่ก่อนบอทออนไลน์ แล้ววนซ้ำเป็นระยะ (เผื่อแชทเด้งหลุด)
+if (CATCHUP && ai.isEnabled()) {
+  console.log(`${C.dim}ตามเก็บ:${C.reset} ห้องที่ยังไม่อ่านย้อนหลัง ${CATCHUP_DAYS} วัน · สูงสุด ${CATCHUP_LIMIT} ห้อง/รอบ` +
+    (CATCHUP_EVERY_MIN > 0 ? ` · ซ้ำทุก ${CATCHUP_EVERY_MIN} นาที` : ' · ครั้งเดียวตอนเริ่ม'));
+  await catchUpUnread();
+  if (CATCHUP_EVERY_MIN > 0) {
+    setInterval(() => { catchUpUnread().catch(() => {}); }, CATCHUP_EVERY_MIN * 60_000).unref();
+  }
+}
 
 // ปิด socket ให้เรียบร้อยเวลา nodemon รีสตาร์ต (SIGUSR2) หรือกด Ctrl+C
 for (const sig of ['SIGINT', 'SIGTERM', 'SIGUSR2']) {
