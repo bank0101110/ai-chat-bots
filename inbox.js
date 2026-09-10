@@ -31,6 +31,8 @@ function loadEnv(file) {
     if ((v.startsWith('"') && v.endsWith('"')) || (v.startsWith("'") && v.endsWith("'"))) {
       v = v.slice(1, -1);
     } else {
+      if (v.startsWith('#')) v = '';           // ทั้งบรรทัดหลัง = เป็นคอมเมนต์ → ถือว่าไม่ได้ตั้งค่า
+
       const h = v.search(/[ 	]#/);           // ตัดคอมเมนต์ท้ายบรรทัด (เว้นวรรค + #)
       if (h >= 0) v = v.slice(0, h).trim();
     }

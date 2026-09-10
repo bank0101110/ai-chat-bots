@@ -18,9 +18,10 @@
  *   - คำสั่งซื้อจริงของลูกค้าคนนั้นจาก Duoke — watch.js ส่งมาทาง orderContext
  *     (ดู formatOrders + needsOrderInfo · ตั้งค่าโหมดที่ AI_ORDER_CONTEXT)
  *
- * รองรับ 2 เจ้า เลือกด้วย AI_PROVIDER ใน .env:
+ * รองรับ 3 เจ้า เลือกด้วย AI_PROVIDER ใน .env:
  *   anthropic (ค่าเริ่มต้น) → Claude   · ใช้ ANTHROPIC_API_KEY · โมเดลเริ่มต้น claude-haiku-4-5
  *   openai                  → GPT      · ใช้ OPENAI_API_KEY    · โมเดลเริ่มต้น gpt-4o-mini
+ *   gemini                  → Gemini   · ใช้ GEMINI_API_KEY    · โมเดลเริ่มต้น gemini-3.5-flash
  * เปลี่ยนโมเดลเองได้ด้วย AI_MODEL (เช่น claude-sonnet-5, gpt-4o)
  */
 
@@ -77,11 +78,40 @@ function askBack(reason) {
 const PROVIDER = (process.env.AI_PROVIDER || 'anthropic').toLowerCase();
 const MAX_TOKENS = Number(process.env.AI_MAX_TOKENS || 1024);
 
-/** โมเดลที่ใช้ — ตั้ง AI_MODEL เองได้ ไม่งั้นใช้ตัวเล็ก/ถูกของแต่ละเจ้า */
-function modelName() {
-  if (process.env.AI_MODEL) return process.env.AI_MODEL;
-  return PROVIDER === 'openai' ? 'gpt-4o-mini' : 'claude-haiku-4-5';
+/** โมเดลตัวเล็ก/ถูกของแต่ละเจ้า ใช้เมื่อไม่ได้ตั้ง AI_MODEL */
+function defaultModel() {
+  if (PROVIDER === 'openai') return 'gpt-4o-mini';
+  if (PROVIDER === 'gemini') return 'gemini-3.5-flash';
+  return 'claude-haiku-4-5';
 }
+
+// ชื่อโมเดลของแต่ละเจ้า — ใช้ตรวจว่า AI_MODEL ที่ตั้งไว้เข้ากับ AI_PROVIDER ที่เลือกไหม
+const MODEL_PATTERN = {
+  anthropic: /^claude-/i,
+  openai: /^(gpt-|o\d)/i,
+  gemini: /^(gemini-|models\/gemini-)/i,
+};
+let _modelWarning = null;
+
+/** ถ้า AI_MODEL ไม่เข้ากับ provider ที่เลือก ให้ใช้ค่าเริ่มต้นของ provider นั้นแทน */
+function resolveModel() {
+  const want = (process.env.AI_MODEL || '').trim();
+  const fallback = defaultModel();
+  if (!want) return fallback;
+  const re = MODEL_PATTERN[PROVIDER];
+  if (re && !re.test(want)) {
+    _modelWarning = `AI_MODEL="${want}" ไม่ใช่โมเดลของ ${PROVIDER} — ใช้ ${fallback} แทน (ลบ AI_MODEL ใน .env หรือเปลี่ยนให้ตรง provider)`;
+    return fallback;
+  }
+  return want;
+}
+let _model = null;
+/** โมเดลที่ใช้จริง (คิดครั้งเดียวแล้วจำไว้) */
+function modelName() {
+  if (_model === null) _model = resolveModel();
+  return _model;
+}
+
 // ต้องเห็นบริบทย้อนหลังพอ ไม่งั้นข้อความสั้น ๆ อย่าง "5*8" หรือ "เอาอันนี้" จะตีความไม่ออก
 const MAX_HISTORY = Number(process.env.AI_MAX_HISTORY || 20);   // กี่ข้อความล่าสุดที่ป้อนให้ AI
 // ให้ AI "ดูรูป" ที่ลูกค้าส่งมาจริง ๆ (ต้องใช้โมเดลที่อ่านรูปได้ — claude ทุกตัว / gpt-4o ขึ้นไป)
@@ -302,8 +332,22 @@ function getAnthropic() {
   return anthropicClient;
 }
 
-function getOpenAI() {
-  if (!openaiClient) {
+// Gemini มี endpoint ที่เข้ากันได้กับ OpenAI จึงใช้ไลบรารี openai ตัวเดิมได้เลย
+// ไม่ต้องลง SDK เพิ่ม — แค่เปลี่ยน baseURL กับคีย์
+// ⚠ ทางนี้ไม่มี prompt caching แบบสั่งเองและไม่มีเครื่องมือค้นเว็บ (Gemini แคชให้เองอัตโนมัติ)
+const GEMINI_BASE_URL = process.env.AI_GEMINI_BASE_URL
+  || 'https://generativelanguage.googleapis.com/v1beta/openai/';
+
+/** ใช้ร่วมกันทั้ง openai และ gemini เพราะรูปแบบ API เหมือนกัน */
+function getOpenAICompatible() {
+  if (openaiClient) return openaiClient;
+  if (PROVIDER === 'gemini') {
+    const apiKey = cleanApiKey('GEMINI_API_KEY') || cleanApiKey('GOOGLE_API_KEY');
+    if (!apiKey) {
+      throw new Error('ยังไม่ได้ตั้ง GEMINI_API_KEY ใน .env (คีย์จาก aistudio.google.com/apikey)');
+    }
+    openaiClient = new OpenAI({ apiKey, baseURL: GEMINI_BASE_URL });
+  } else {
     const apiKey = cleanApiKey('OPENAI_API_KEY');
     if (!apiKey) {
       throw new Error('ยังไม่ได้ตั้ง OPENAI_API_KEY ใน .env (คีย์จาก platform.openai.com)');
@@ -336,8 +380,8 @@ function webSearchType() {
 
 /** เรียก LLM ตาม provider ที่เลือก → คืนข้อความล้วน */
 async function callLLM({ systemBlocks, messages, maxTokens }) {
-  if (PROVIDER === 'openai') {
-    // OpenAI: system เป็นข้อความเดียว (แคชอัตโนมัติฝั่ง OpenAI ไม่ต้องใส่ cache_control)
+  if (PROVIDER === 'openai' || PROVIDER === 'gemini') {
+    // ทั้งสองเจ้าใช้รูปแบบ OpenAI: system เป็นข้อความเดียว (แคชให้เองฝั่งผู้ให้บริการ)
     // และบล็อกรูปคนละรูปแบบกับ Anthropic → แปลง image → image_url ก่อนส่ง
     const systemText = systemBlocks.map(b => b.text).join('\n\n');
     const msgs = messages.map(m => ({
@@ -348,11 +392,21 @@ async function callLLM({ systemBlocks, messages, maxTokens }) {
           : { type: 'text', text: b.text }))
         : m.content,
     }));
-    const res = await getOpenAI().chat.completions.create({
+    const res = await getOpenAICompatible().chat.completions.create({
       model: modelName(),
       max_tokens: maxTokens,
       messages: [{ role: 'system', content: systemText }, ...msgs],
     });
+    // ทางนี้ไม่แยกโทเคนที่แคชไว้ให้ดู มีแต่ยอดรวม → ใส่ใน in/out ตรง ๆ
+    const u = res.usage ?? {};
+    _lastUsage = {
+      in: u.prompt_tokens ?? 0,
+      cacheWrite: 0,
+      cacheRead: u.prompt_tokens_details?.cached_tokens ?? 0,
+      out: u.completion_tokens ?? 0,
+      searches: 0,
+    };
+    _lastSources = '';
     return (res.choices?.[0]?.message?.content ?? '').trim();
   }
   // Anthropic (Claude): system เป็น array บล็อก (มี cache_control สำหรับ prompt caching)
@@ -402,7 +456,9 @@ export function isInboxMode() {
 
 /** ข้อมูล provider/model ไว้โชว์สถานะ */
 export function providerInfo() {
-  return { provider: PROVIDER, model: isInboxMode() ? '(คิวไฟล์ inbox/)' : modelName() };
+  const model = isInboxMode() ? '(คิวไฟล์ inbox/)' : modelName();
+  // _modelWarning ตั้งค่าตอน resolveModel() จึงต้องเรียก modelName() ก่อนอ่าน
+  return { provider: PROVIDER, model, warning: _modelWarning ?? undefined };
 }
 
 // --------------------------------------------------------- ★ system prompt ★
@@ -508,6 +564,15 @@ export function buildSystemPrompt({ shopName, platform, buyerName }) {
       'เรื่องใบกำกับภาษี/ใบเสร็จ ให้ตอบตามข้อมูลร้านแบบเป๊ะ ๆ ห้ามเปลี่ยนวิธีจัดส่งเอกสารเอง',
       '',
       'ข้อความล้วน ห้าม markdown (**ตัวหนา** #) เพราะแชทแสดงเป็นดอกจันตรง ๆ',
+      '',
+      'ถ้าแพลตฟอร์มคือ shopee: ห้ามใช้คำว่า "ยกเลิก" เด็ดขาด เพราะ Shopee บล็อกข้อความที่มีคำนี้',
+      'ทั้งข้อความจะส่งไม่ออกและลูกค้าจะไม่ได้รับอะไรเลย ให้เลี่ยงไปใช้คำที่สื่อความหมายเดียวกัน เช่น',
+      '  "ปิดรายการสั่งซื้อ" · "ไม่ดำเนินการต่อ" · "คืนรายการ" · "ขอปิดออร์เดอร์นี้"',
+      'เขียนประโยคให้เข้ารูปกับคำที่เลี่ยงตั้งแต่แรก อย่าเขียน "ยกเลิก" แล้วหวังให้ระบบแก้ให้',
+      '',
+      'ถ้าแพลตฟอร์มคือ lazada: ห้ามพิมพ์เลขยาว ๆ ลงในข้อความ โดยเฉพาะเลขคำสั่งซื้อและเลขพัสดุ',
+      'เพราะ Lazada จะเตือนว่าเป็นการแชร์ข้อมูลส่วนตัวในแชท ให้เรียกว่า "คำสั่งซื้อของลูกค้า"',
+      'หรือ "รายการที่ลูกค้าแจ้งมา" แทน ลูกค้ารู้เลขของตัวเองอยู่แล้ว ไม่ต้องทวนให้',
       'ห้ามเขียนเป็นข้อ 1. 2. 3. ให้เขียนเป็นประโยคต่อเนื่อง',
       'คำลงท้ายต้องเป็นเพศเดียวกันทุกประโยคในข้อความเดียว ห้ามสลับ ครับ/ค่ะ ไปมา',
       '(ใช้ตามที่ระบุในข้อมูลร้าน ถ้าไม่ระบุให้ใช้ ครับ ทั้งหมด) · เรียกลูกค้าว่า "ลูกค้า" เท่านั้น ห้ามเรียกน้อง/พี่',
@@ -734,15 +799,117 @@ export function formatOrders(orders, max = 3) {
   return out.join('\n');
 }
 
+/**
+ * ข้อความฝั่งร้านนี้ ใครส่ง — ดูจากฟิลด์ที่ Duoke ให้มา แม่นกว่าเดาจากเนื้อข้อความ
+ * (สำรวจจากข้อมูลจริง 194 ข้อความ พบรูปแบบนี้)
+ *   messageSource=2 + มี account  → คนกดส่งผ่านบัญชีแอดมิน (คนจริง หรือบอทเราที่ล็อกอินบัญชีนั้น)
+ *   messageSource=1 หรือ 3 + account=null → บอทของแพลตฟอร์มยิงอัตโนมัติ
+ *
+ * @param {object} msg  ข้อความจาก getMessageList
+ * @param {string} [myUid]  uid ของบัญชีที่บอทเราใช้ (จาก .token.json) — ถ้าให้มาจะแยก 'me' ออกได้
+ * @returns {'platform-bot'|'me'|'staff'}
+ */
+/** ย่อข้อความเป็นบรรทัดเดียวสั้น ๆ สำหรับใส่ใน log */
+function oneLineShort(t, max = 40) {
+  return String(t ?? '').replace(/s+/g, ' ').trim().slice(0, max);
+}
+
+export function shopSenderKind(msg, myUid) {
+  const src = Number(msg?.messageSource);
+  const acc = msg?.account;
+  // ไม่มีชื่อบัญชีกำกับ = ไม่ใช่คนกดส่ง (แพลตฟอร์มยิงเอง)
+  if (!acc && (src === 1 || src === 3)) return 'platform-bot';
+  if (!acc) return 'platform-bot';
+  if (myUid && String(msg?.uid) === String(myUid)) return 'me';
+  return 'staff';
+}
+
+// ---------------------------------------- คำที่แพลตฟอร์มบล็อกไม่ให้ส่ง
+// Shopee ไม่ยอมให้ส่งข้อความที่มีคำว่า "ยกเลิก" — ถ้าหลุดไปคำเดียว ข้อความทั้งอันส่งไม่ออก
+// (ลูกค้าจะเงียบไปเลยโดยที่ระบบไม่แจ้ง error) จึงต้องเปลี่ยนคำก่อนส่งทุกครั้ง
+// เพิ่ม/แก้เองได้ด้วย AI_WORD_SWAP_<PLATFORM> ใน .env รูปแบบ "คำเดิม=คำใหม่,คำเดิม2=คำใหม่2"
+const DEFAULT_WORD_SWAP = {
+  shopee: [
+    ['ยกเลิกคำสั่งซื้อ', 'ปิดรายการสั่งซื้อ'],
+    ['ยกเลิกออร์เดอร์', 'ปิดรายการสั่งซื้อ'],
+    ['ยกเลิกออเดอร์', 'ปิดรายการสั่งซื้อ'],
+    ['ยกเลิกรายการ', 'ปิดรายการ'],
+    ['การยกเลิก', 'การปิดรายการ'],
+    ['ขอยกเลิก', 'ขอปิดรายการ'],
+    ['ยกเลิก', 'ปิดรายการ'],          // ต้องอยู่ท้ายสุด เพื่อให้คำที่ยาวกว่าถูกแทนก่อน
+  ],
+};
+
+let _lastSwapped = [];
+
+/** อ่านรายการเปลี่ยนคำของแพลตฟอร์มนั้น (ค่าใน .env เขียนทับค่าเริ่มต้น) */
+function wordSwapFor(platform) {
+  const p = String(platform ?? '').toLowerCase();
+  if (!p) return [];
+  const custom = process.env[`AI_WORD_SWAP_${p.toUpperCase()}`];
+  if (custom) {
+    return custom.split(',').map(pair => {
+      const [from, to] = pair.split('=');
+      return [String(from ?? '').trim(), String(to ?? '').trim()];
+    }).filter(([f]) => f);
+  }
+  return DEFAULT_WORD_SWAP[p] ?? [];
+}
+
+// แพลตฟอร์มที่เตือนเรื่อง "แชร์ข้อมูลส่วนตัวในแชท" เมื่อเจอตัวเลขยาว ๆ
+// (Lazada เตือนเมื่อข้อความมีเลขคำสั่งซื้อ 16 หลัก — ระบบมองว่าอาจเป็นเบอร์โทร/ข้อมูลส่วนตัว)
+// ลูกค้ารู้เลขออร์เดอร์ของตัวเองอยู่แล้ว และเจ้าหน้าที่เห็นใน Duoke จึงไม่จำเป็นต้องพิมพ์ซ้ำ
+const MASK_LONG_DIGITS = { lazada: true };
+// เลขล้วนยาว 10 หลักขึ้นไป และต้องไม่มีตัวอักษรติดหน้า/หลัง
+// เพื่อไม่ให้ไปโดนเลขพัสดุที่มีตัวอักษรนำอย่าง TH01234567890 หรือ SPX... ซึ่งลูกค้าต้องใช้จริง
+const LONG_DIGITS_RE = /(?<![A-Za-z0-9])\d{10,}(?![A-Za-z0-9])/g;
+
+/** เปลี่ยนคำที่แพลตฟอร์มบล็อก + ปิดเลขยาว → คืน { text, swapped: [...] } */
+export function sanitizeForPlatform(text, platform) {
+  let outText = String(text ?? '');
+  const swapped = [];
+  for (const [from, to] of wordSwapFor(platform)) {
+    if (!from || !outText.includes(from)) continue;
+    outText = outText.split(from).join(to);
+    swapped.push(`${from}→${to}`);
+  }
+
+  const p = String(platform ?? '').toLowerCase();
+  const maskEnv = process.env[`AI_MASK_DIGITS_${p.toUpperCase()}`];
+  const shouldMask = maskEnv ? maskEnv === 'true' : Boolean(MASK_LONG_DIGITS[p]);
+  if (shouldMask) {
+    outText = outText.replace(LONG_DIGITS_RE, m => {
+      swapped.push(`ปิดเลขยาว(${m.replace(/\D/g, '').length} หลัก)`);
+      return 'ที่แจ้งไว้';
+    }).replace(/\s{2,}/g, ' ').replace(/\s+([,.!?])/g, '$1');
+  }
+
+  return { text: outText, swapped };
+}
+
+// ข้อความสำเร็จรูปที่แพลตฟอร์ม/ร้านยิงอัตโนมัติ — ไม่นับว่า "มีคนตอบแล้ว"
+// ใช้เป็นตัวสำรองเมื่อแพลตฟอร์มไม่ส่งฟิลด์ account/messageSource มาให้
+// (ชุดเดียวกับที่ learn-replies.js ใช้กรองตอนดูดตัวอย่างคำตอบ)
+const CANNED_REPLY_RE = new RegExp([
+  'เรียนคุณลูกค้าที่เคารพ', 'นอกเวลาทำการ', 'ได้รับข้อความของ(คุณ|ท่าน)แล้ว',
+  'กรุณารอสักครู่', 'รอสักครู่', 'ทีมงานของเรากำลังยุ่ง', 'ยินดีต้อนรับ',
+  'มีอะไรให้ช่วยเหลือ', 'สอบถามด้านใด', 'ถามมาได้เลย', 'แจ้งทางร้านได้เลย',
+  'ขอบคุณสำหรับความสนใจ', 'ติดตามคำสั่งซื้อ', 'ลูกค้าติดตามร้าน',
+  'วันนี้มีอะไรให้เราช่วย', 'has been assigned', 'chat has been',
+].join('|'), 'i');
+
 // เรื่องที่ต้องให้เจ้าหน้าที่ตามต่อเสมอ ไม่ว่า AI จะติดธงว่าอะไร
 // (haiku ไม่ทำตามกฎใน prompt ทุกครั้ง — บังคับในโค้ดชัวร์กว่า)
 // สั้นและเจาะจง เพื่อไม่ให้ดักคำถามทั่วไปจนเจ้าหน้าที่ท่วม
 const MUST_STAFF_RE = new RegExp([
+  // ★ ส่งของผิด — เรื่องหลักที่ต้องให้คนดู
+  'ส่งผิด', 'ส่งมาผิด', 'ได้ผิด', 'ผิดรุ่น', 'ผิดสี', 'ผิดขนาด', 'ผิดแบบ', 'ผิดตัว', 'ไม่ตรงปก',
+  'คนละ(รุ่น|สี|ขนาด|แบบ|อัน|ตัว)', 'ไม่ใช่ที่สั่ง', 'ไม่ตรงที่สั่ง',
+  // ของขาด/หาย/พัง — ร้านต้องส่งเพิ่มหรือชดเชย
+  'ของหาย', 'ไม่ได้รับของ', 'ของไม่ครบ', 'ได้ไม่ครบ', 'ขาดไป', 'ชำรุด', 'แตกหัก', 'ของเสีย',
+  // เรื่องเงิน
   'เคลม', 'คืนเงิน', 'คืนสินค้า', 'รีฟัน', 'refund',
-  'ของหาย', 'ไม่ได้รับของ', 'ของไม่ครบ', 'ได้ไม่ครบ', 'ส่งผิด', 'ผิดรุ่น', 'ผิดสี', 'ผิดขนาด',
-  'ชำรุด', 'แตกหัก', 'ของเสีย', 'ใช้ไม่ได้',
-  'ยกเลิกออร์เดอร์', 'ยกเลิกคำสั่งซื้อ',
-  'ลดราคา', 'ลดได้', 'ต่อรอง', 'ขอส่วนลด', 'ถูกกว่านี้', 'แถม',
+  // ลูกค้าไม่พอใจ
   'ร้องเรียน', 'ไม่พอใจ', 'แย่มาก', 'โกง',
 ].join('|'), 'i');
 
@@ -868,7 +1035,7 @@ function buildProductContext(rawMessages, dialogue) {
   return parts.join('\n\n');
 }
 
-export async function generateReply({ messages, shopName, platform, buyerName, orderContext }) {
+export async function generateReply({ messages, shopName, platform, buyerName, orderContext, myUid }) {
   const dialogue = toAnthropicMessages(messages || []);
   if (!dialogue.length) return askBack('ไม่มีข้อความให้ตอบ');
 
@@ -881,6 +1048,39 @@ export async function generateReply({ messages, shopName, platform, buyerName, o
     trailingShop.unshift(contentText(dialogue.pop().content));
   }
   if (!dialogue.length) return askBack('ไม่มีข้อความของลูกค้า');
+
+  // ข้อความของร้านที่มาหลังคำถามล่าสุดของลูกค้า มี 2 แบบ
+  //   1. auto-reply สำเร็จรูปของแพลตฟอร์ม ("รอสักครู่" "นอกเวลาทำการ") → ยังต้องตอบ
+  //   2. คำตอบจริงที่คนพิมพ์เอง (หรือบอทตอบไปแล้ว)                    → ห้ามตอบซ้ำ
+  // เดิมปล่อยให้ AI ตัดสินด้วยธง [[SKIP]] ซึ่งพลาดบ่อย จึงเช็คในโค้ดแทน
+  // เช็คจากฟิลด์ของ Duoke ก่อน (แม่นกว่า) — เอาข้อความฝั่งร้านที่มาหลังคำถามล่าสุดของลูกค้า
+  const rawMsgs = messages || [];
+  const rawTrailing = [];
+  for (let i = rawMsgs.length - 1; i >= 0; i--) {
+    if (rawMsgs[i].fromAccountType === 1) break;
+    rawTrailing.unshift(rawMsgs[i]);
+  }
+  const byHuman = rawTrailing.find(m => {
+    const kind = shopSenderKind(m, myUid);
+    if (kind === 'platform-bot') return false;          // บอทแพลตฟอร์ม → ยังต้องตอบ
+    return (renderForAI(m) || '').length >= 5;          // คนหรือบอทเราตอบไปแล้ว → ห้ามตอบซ้ำ
+  });
+  if (byHuman) {
+    const who = shopSenderKind(byHuman, myUid) === 'me' ? 'บอทตอบไปแล้ว' : `${byHuman.account} ตอบไปแล้ว`;
+    _lastUsage = { in: 0, cacheWrite: 0, cacheRead: 0, out: 0, searches: 0 };   // ไม่ได้เรียก AI
+    return { needsStaff: false, skip: true, reason: `${who}: ${oneLineShort(renderForAI(byHuman))}` };
+  }
+
+  // สำรอง: แพลตฟอร์มบางเจ้าไม่ส่ง account/messageSource มา → เดาจากเนื้อข้อความแบบเดิม
+  const realReply = rawTrailing.length === 0
+    ? null
+    : trailingShop.find(t => t && t.length >= 12 && !CANNED_REPLY_RE.test(t)
+        && rawTrailing.every(m => m.account === undefined));
+  if (realReply) {
+    _lastUsage = { in: 0, cacheWrite: 0, cacheRead: 0, out: 0, searches: 0 };
+    return { needsStaff: false, skip: true, reason: 'มีคนตอบไปแล้ว: ' + realReply.slice(0, 40) };
+  }
+
   if (trailingShop.length) {
     dialogue.push({ role: 'user', content: `[ทางร้านตอบไปแล้วว่า: ${trailingShop.join(' / ')}]` });
   }
@@ -946,8 +1146,13 @@ export async function generateReply({ messages, shopName, platform, buyerName, o
     if (loadProductDetail(id) || loadCatalog().some(r => r.id === id)) sendItemId = id;
   }
 
-  const reply = text.replace(MARK_RE, '').replace(SEND_ITEM_RE, '').trim();
-  if (!reply) return askBack('AI ไม่ได้ร่างคำตอบ');
+  const drafted = text.replace(MARK_RE, '').replace(SEND_ITEM_RE, '').trim();
+  if (!drafted) return askBack('AI ไม่ได้ร่างคำตอบ');
+
+  // เปลี่ยนคำที่แพลตฟอร์มบล็อก (เช่น "ยกเลิก" บน Shopee) ก่อนใช้ต่อทุกทาง
+  // ทำที่นี่จุดเดียว เพื่อให้ทั้งที่ log และที่ส่งจริงเป็นข้อความเดียวกัน
+  const { text: reply, swapped } = sanitizeForPlatform(drafted, platform);
+  _lastSwapped = swapped;
 
   // การ์ดกันแต่งตัวเลข — ทดสอบแล้วทั้ง haiku และ sonnet ยังแต่ง "ส่งภายใน 2-3 วัน" เองได้
   // แม้สั่งห้ามใน prompt แล้ว (ความรู้ทั่วไปของโมเดลแรงกว่าคำสั่ง)
@@ -983,10 +1188,10 @@ export async function generateReply({ messages, shopName, platform, buyerName, o
     .filter(t => !/^\s*\[/.test(t))
     .join(' ');
   if (MUST_STAFF_RE.test(buyerSaid)) {
-    return { reply, sendItemId, needsStaff: true, reason: 'เรื่องที่ต้องให้เจ้าหน้าที่ตามต่อ' };
+    return { reply, sendItemId, swapped: _lastSwapped, needsStaff: true, reason: 'เรื่องที่ต้องให้เจ้าหน้าที่ตามต่อ' };
   }
 
-  return { reply, sendItemId, needsStaff: flag === 'STAFF' };
+  return { reply, sendItemId, swapped: _lastSwapped, needsStaff: flag === 'STAFF' };
 }
 
 export default { isEnabled, autoSend, generateReply };

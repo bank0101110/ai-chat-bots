@@ -8,14 +8,13 @@
  *   DUOKE_EMAIL=you@example.com     ← จำเป็น
  *   DUOKE_PASSWORD=...              ← จำเป็น
  *   ONLY_BUYER=true                 ← log เฉพาะข้อความจากลูกค้า (default: true)
- *   LOG_FILE=chat.log               ← เขียน log ลงไฟล์ด้วย (เว้นว่าง = ไม่เขียน)
+ *   LOG_FILE=                       ← เว้นว่าง = ขึ้นจออย่างเดียว ไม่เขียนไฟล์ (ค่าเริ่มต้น)
  *   SHOW_CONVERSATIONS=false        ← log ตอนรายการห้องแชทอัปเดตด้วย
- *   LOG_CONSOLE_MAX=160             ← ย่อข้อความบนจอกี่ตัวอักษร (ในไฟล์ log เก็บเต็มเสมอ)
- *   LOG_RAW=true                    ← แนบ JSON ดิบของข้อความ+ห้องแชทไว้ในไฟล์ log (default: true)
+ *   LOG_CONSOLE_MAX=160             ← ย่อข้อความบนจอกี่ตัวอักษร
+ *   LOG_RAW=false                   ← ดัมป์ JSON ดิบของทุกข้อความ (รกมาก เปิดเฉพาะตอนดีบั๊ก)
  *
- * เรื่อง log: บนจอย่อให้อ่านง่าย แต่ในไฟล์ LOG_FILE เก็บครบ — ข้อความเต็ม ไม่ตัด …,
- * การ์ดสินค้า/ออร์เดอร์กางเป็นช่อง ๆ (ชื่อ ตัวเลือก ราคา จำนวน itemId ลิงก์) และถ้า
- * LOG_RAW=true จะมีบรรทัด "↳ raw {...}" ต่อท้ายทุกข้อความ = ข้อมูลดิบทั้งหมดที่ดึงมาได้
+ * เรื่อง log: จัดเป็นบล็อกต่อห้องแชท — ขึ้นหัวว่า "ร้าน·แพลตฟอร์ม ชื่อลูกค้า" หนึ่งครั้ง
+ * แล้วข้อความกับสิ่งที่บอททำอยู่ย่อหน้าใต้หัวนั้น จะได้รู้ว่ากำลังคุยกับใครอยู่
  *
  * ลำดับการทำงาน:
  *   1. หา token ที่ใช้ได้ — จากแคช .token.json ก่อน ถ้าใช้ไม่ได้ค่อยล็อกอินด้วย email/password
@@ -23,6 +22,10 @@
  *   2. เอา token ที่ได้ไปต่อ REST + socket.io
  *   3. ระหว่างทางถ้าเจอ 401 → ล็อกอินใหม่แล้วต่อ socket ใหม่ให้เอง
  */
+
+// ⚠ ต้องเป็นบรรทัดแรกสุด — โหลด .env ก่อนโมดูลอื่นที่อ่าน process.env ตอน import
+// (ai-bot.js อ่านค่า AI_* ตอน import ถ้าโหลด .env ทีหลังค่าจะไม่มีผล)
+import './env.js';
 
 import fs from 'node:fs';
 import path from 'node:path';
@@ -47,6 +50,8 @@ const AUTO_TAG = (process.env.AUTO_TAG ?? 'true') !== 'false';
 const AUTO_TAG_NAME = process.env.AUTO_TAG_NAME || 'รอเจ้าหน้าที่';
 const AUTO_TAG_AI_NAME = process.env.AUTO_TAG_AI_NAME || 'AI ตอบ';
 // ตามเก็บห้องที่ "ยังไม่อ่าน" — ลูกค้าทักมาก่อนบอทออนไลน์ แชทเด้งจับไม่ได้
+// ห้องที่ AI ตอบไม่เคลียร์ ทำเป็น "ยังไม่อ่าน" ให้เจ้าหน้าที่เห็นค้างในลิสต์
+const MARK_UNREAD = (process.env.MARK_UNREAD_ON_STAFF ?? 'true') !== 'false';
 const CATCHUP = (process.env.CATCHUP_UNREAD ?? 'true') !== 'false';
 const CATCHUP_LIMIT = Number(process.env.CATCHUP_LIMIT || 20);      // ตอบได้สูงสุดกี่ห้องต่อรอบ
 const CATCHUP_DAYS = Number(process.env.CATCHUP_DAYS || 3);         // ย้อนหลังไม่เกินกี่วัน
@@ -102,6 +107,37 @@ function ts() {
   });
 }
 
+// ---- log เป็น JSON บรรทัดละอีเวนต์ (JSON Lines) ----
+// ไม่มีอีโมจิ ไม่มีสี — เอาไปกรองด้วย jq / grep / ส่งเข้าระบบเก็บ log ได้ตรง ๆ
+//   node watch.js | jq -c 'select(.event=="ai_reply")'
+// ทุกอีเวนต์ที่เกิดในห้องแชทจะมี shop/platform/buyer/conversationId ติดไปด้วยเสมอ
+// จะได้รู้ทันทีว่าเป็นของลูกค้าคนไหน ไม่ต้องไล่ดูบรรทัดก่อนหน้า
+
+/** พิมพ์ 1 อีเวนต์ */
+function out(obj) {
+  const line = JSON.stringify({ time: ts(), ...obj });
+  console.log(line);
+  if (LOG_FILE) fs.appendFile(LOG_FILE, `${line}\n`, () => {});
+}
+
+// viewConversation ไม่คืน buyerNick มาให้ (ชื่อลูกค้ามาจากลิสต์ห้องหรือ socket เท่านั้น)
+// จึงจำไว้ครั้งแรกที่รู้ แล้วใช้กับอีเวนต์ถัด ๆ ไปของห้องเดียวกัน
+const buyerNames = new Map();
+
+/** พิมพ์อีเวนต์ที่ผูกกับห้องแชท — เติมข้อมูลห้องให้อัตโนมัติ */
+function outRoom(e, info, obj) {
+  const cid = e?.conversationId;
+  const nick = info?.buyerNick ?? convCache.get(cid)?.buyerNick;
+  if (nick) buyerNames.set(cid, nick);
+  out({
+    shop: info?.shopName ?? shopNameOf(e?.shopId) ?? e?.shopId,
+    platform: e?.platform,
+    buyer: buyerNames.get(cid) ?? cid,
+    conversationId: cid,
+    ...obj,
+  });
+}
+
 function log(line, plain = null) {
   console.log(line);
   if (LOG_FILE) fs.appendFile(LOG_FILE, `${plain ?? stripAnsi(line)}\n`, () => {});
@@ -137,12 +173,20 @@ function loadEnv(file) {
     if ((v.startsWith('"') && v.endsWith('"')) || (v.startsWith("'") && v.endsWith("'"))) {
       v = v.slice(1, -1);
     } else {
+      if (v.startsWith('#')) v = '';           // ทั้งบรรทัดหลัง = เป็นคอมเมนต์ → ถือว่าไม่ได้ตั้งค่า
+
       const h = v.search(/[ 	]#/);           // ตัดคอมเมนต์ท้ายบรรทัด (เว้นวรรค + #)
       if (h >= 0) v = v.slice(0, h).trim();
     }
     if (!(k in process.env)) process.env[k] = v;
   }
 }
+
+/** ชื่อร้านจาก shopId (เผื่อ info ไม่มีมาให้ เช่นตอนตามเก็บห้องค้าง) */
+function shopNameOf(shopId) {
+  return shopList.find(s => String(s.id ?? s.shopId) === String(shopId))?.shopName;
+}
+let shopList = [];
 
 function preview(text, max = LOG_CONSOLE_MAX) {
   const one = oneLine(text);
@@ -232,6 +276,7 @@ let aiTagId = null;                 // tagId ของ "AI ตอบ" (resolve �
 let invoiceTagId = null;            // tagId ของแท็กใบกำกับ (ยอดถึงเกณฑ์)
 let slipTagId = null;               // tagId ของแท็กสลิปออนไลน์ (ยอดไม่ถึง)
 let myPuid = null;                  // puid ของบัญชี — ใช้ตอนส่งข้อความกลับ
+let myUid = null;                   // uid ของบัญชี — ใช้แยกว่าข้อความฝั่งร้านเป็นของบอทเราหรือคนอื่น
 
 // ---------------------------------------------------------------- ขั้นที่ 1: login
 
@@ -239,7 +284,7 @@ async function authenticate({ force = false } = {}) {
   const s = await getSession({ force, email: EMAIL, password: PASSWORD });
   const how = { cache: 'ใช้ token ที่แคชไว้', env: 'ใช้ DUOKE_TOKEN จาก .env', login: 'ล็อกอินใหม่' }[s.source];
   const left = s.expAt ? ` (เหลืออีก ~${Math.floor((s.expAt - Date.now()) / 86400000)} วัน)` : '';
-  log(`${C.gray}${ts()}${C.reset} 🔑 ${how}${left}`);
+  out({ event: 'login', how: stripAnsi(how).trim(), detail: stripAnsi(left).trim() || undefined });
   return s;
 }
 
@@ -259,39 +304,42 @@ async function getConvInfo({ shopId, conversationId, platform }) {
 }
 
 // เพิ่มแท็กให้ห้องแชท (idempotent — มีอยู่แล้วไม่ทำซ้ำ)
+// tagId → ชื่อแท็ก (โหลดรายการแท็กทั้งบัญชีไว้ตอนเริ่ม) เพื่อให้ log อ่านรู้เรื่อง
+let tagNameById = new Map();
+function tagName(id) {
+  return tagNameById.get(String(id)) ?? String(id);
+}
+
 async function addConversationTag(e, info, tagId, label) {
   if (!tagId) return;
-  const currentTagIds = info.tagIdList ?? info.dkConversationVO?.tagIdList;
-  if (Array.isArray(currentTagIds) && currentTagIds.includes(tagId)) return;
   try {
+    // ⚠ ห้ามส่งรายการแท็กจาก cache — updateConversationTag เป็นการ "เขียนทับทั้งชุด"
+    // ถ้าเจ้าหน้าที่เพิ่งติดแท็กในเว็บหลังจากบอทแคชไว้ แท็กนั้นจะถูกลบทิ้ง
+    // ปล่อยให้ addTagToConversation ไปอ่านของสด ๆ เองทุกครั้ง (แลกกับ API อีก 1 ครั้ง)
+    const before = info.tagIdList ?? info.dkConversationVO?.tagIdList;
     const newList = await api.addTagToConversation({
       shopId: e.shopId, conversationId: e.conversationId, platform: e.platform,
-      tagId, currentTagIds,          // undefined = ให้ไปอ่านของเดิมเอง
+      tagId,
     });
     info.tagIdList = newList;         // อัปเดต cache
     if (newList.includes(tagId)) {
-      log(`${C.gray}          ↳ 🏷  ติดแท็ก “${label}”${C.reset}`);
+      // log แท็กทั้งชุดก่อน/หลัง เพื่อให้ตรวจย้อนได้ว่าไม่มีของใครหายไป
+      outRoom(e, info, {
+        event: 'tag_add',
+        tag: label,
+        tagsBefore: Array.isArray(before) ? before.map(tagName) : undefined,
+        tagsAfter: newList.map(tagName),
+      });
     }
   } catch (err) {
     if (isAuthError(err)) return relogin();
-    log(`${C.gray}${ts()}${C.reset} ${C.yellow}⚠️  ติดแท็กไม่สำเร็จ:${C.reset} ${err.message}`);
+    out({ event: 'warn', what: 'ติดแท็ก', error: err.message });
   }
 }
 
-// เอาแท็กออกจากห้องแชท (idempotent — ไม่มีอยู่ก็ข้าม)
-async function removeConversationTag(e, info, tagId, label) {
-  if (!tagId) return;
-  const currentTagIds = info.tagIdList ?? info.dkConversationVO?.tagIdList;
-  if (!Array.isArray(currentTagIds) || !currentTagIds.includes(tagId)) return;
-  try {
-    await api.deleteConversationTag({ shopId: e.shopId, conversationId: e.conversationId, tagId });
-    info.tagIdList = currentTagIds.filter(x => x !== tagId);   // อัปเดต cache
-    log(`${C.gray}          ↳ 🏷  เอาแท็ก “${label}” ออก${C.reset}`);
-  } catch (err) {
-    if (isAuthError(err)) return relogin();
-    log(`${C.gray}${ts()}${C.reset} ${C.yellow}⚠️  เอาแท็กออกไม่สำเร็จ:${C.reset} ${err.message}`);
-  }
-}
+// ⚠ บอทไม่มีฟังก์ชันลบแท็กโดยตั้งใจ — "เพิ่มอย่างเดียว ห้ามลบ"
+// แม้แต่แท็กที่บอทติดเอง ก็ให้เจ้าหน้าที่เป็นคนลบเท่านั้น
+// (ถ้าจะเพิ่มกลับมาในอนาคต ระวัง updateConversationTag ที่เขียนทับทั้งชุด ดู duoke-api.js)
 
 // ส่ง "คำตอบเบื้องต้น" ให้ลูกค้าตอนที่ยังไม่มีคำตอบที่ส่งได้จริง (เคสละเอียดอ่อนที่ร่างยืนยันไม่ได้ /
 // AI ร่างไม่ได้ / โหมดคิวรอคนตอบ) — ลูกค้าจะได้ไม่เงียบระหว่างรอเจ้าหน้าที่
@@ -303,7 +351,7 @@ async function sendHolding(e) {
 
   const last = holdingSentAt.get(e.conversationId) ?? 0;
   if (Date.now() - last < HOLDING_COOLDOWN_MS) {
-    log(`${C.gray}          ↳ 💬 ${C.dim}ส่งคำตอบเบื้องต้นไปแล้วเมื่อไม่นานนี้ — ไม่ส่งซ้ำ${C.reset}`);
+    outRoom(e, null, { event: 'holding', skipped: 'ส่งไปแล้วเมื่อไม่นานนี้' });
     return false;
   }
   try {
@@ -313,11 +361,11 @@ async function sendHolding(e) {
     });
     if (holdingSentAt.size > 1000) holdingSentAt.clear();
     holdingSentAt.set(e.conversationId, Date.now());
-    logLong(`${C.gray}          ↳ 💬 ${C.green}ตอบเบื้องต้นให้ลูกค้าแล้ว${C.reset} ${C.dim}(รอเจ้าหน้าที่ตามต่อ)${C.reset}: `, text);
+    outRoom(e, null, { event: 'holding', sent: true, text: oneLine(text) });
     return true;
   } catch (err) {
     if (isAuthError(err)) relogin();
-    else log(`${C.gray}${ts()}${C.reset} ${C.yellow}⚠️  ส่งคำตอบเบื้องต้นไม่สำเร็จ:${C.reset} ${err.message}`);
+    else outRoom(e, null, { event: 'holding', sent: false, error: err.message });
     return false;
   }
 }
@@ -343,11 +391,11 @@ async function orderContextFor(e, info, messages) {
     const res = await api.getOrderList({ shopId: e.shopId, buyerId, platform: e.platform, pageSize: 5 });
     const list = res?.list ?? [];
     const text = ai.formatOrders(list);
-    if (text) log(`${C.gray}          ↳ 🧾 แนบข้อมูลออร์เดอร์ให้ AI ${list.length} รายการ${C.reset}`);
+    if (text) outRoom(e, info, { event: 'order_context', orders: list.length });
     return text;
   } catch (err) {
     if (isAuthError(err)) relogin();
-    log(`${C.gray}          ↳ ${C.yellow}⚠️  ดึงออร์เดอร์ของลูกค้าไม่สำเร็จ:${C.reset} ${err.message}`);
+    out({ event: 'warn', what: 'ดึงออร์เดอร์', error: err.message });
     return '';
   }
 }
@@ -383,8 +431,131 @@ async function tagInvoiceCase(e, info, messages) {
   const tagId = hit.kind === 'invoice' ? invoiceTagId : slipTagId;
   const label = hit.kind === 'invoice' ? TAG_INVOICE_NAME : TAG_SLIP_NAME;
   if (!tagId) return;
-  log(`${C.gray}          ↳ 🧾 ขอใบกำกับ · ยอด ${hit.amount} (${hit.from}) → ${C.reset}${label}`);
+  outRoom(e, info, { event: 'invoice_tag', amount: hit.amount, source: hit.from, tag: label });
   await addConversationTag(e, info, tagId, label);
+}
+
+/**
+ * หา groupId ของห้อง (ต้องใช้กับคำสั่งทาง socket)
+ * ⚠ viewConversation ไม่คืน groupId มาให้ (เช็คแล้ว 0/6 ห้อง) ต้องหาจากทางอื่น:
+ *   1. อ็อบเจ็กต์ห้องที่ได้จาก queryConversationList / socket event 'conversations'
+ *   2. claimConversation — ได้แน่นอน แต่ยิง API เพิ่ม จึงใช้เป็นทางสุดท้าย
+ *      (เส้นทางที่ส่งข้อความอยู่แล้วก็เรียกตัวนี้อยู่ดี ไม่ได้เพิ่มผลข้างเคียงใหม่)
+ */
+async function resolveGroupId(e, info) {
+  const fromInfo = info?.groupId ?? info?.dkConversationVO?.groupId;
+  if (fromInfo) return fromInfo;
+  const cached = convCache.get(e.conversationId);
+  if (cached?.groupId) return cached.groupId;
+  try {
+    const claimed = await api.claimConversation({
+      shopId: e.shopId, conversationId: e.conversationId, platform: e.platform,
+    });
+    if (claimed?.groupId) {
+      if (info) info.groupId = claimed.groupId;      // จำไว้ ไม่ต้องยิงซ้ำ
+      return claimed.groupId;
+    }
+  } catch { /* หาไม่ได้ก็ไม่เป็นไร */ }
+  return null;
+}
+
+/**
+ * ทำเครื่องหมาย "ยังไม่อ่าน" ให้ห้องที่ AI ตอบไม่เคลียร์ — เจ้าหน้าที่จะได้เห็นค้างในลิสต์
+ * ใช้ groupId ของห้องแปลงเป็น TIM conversationID (GROUP_<groupId>)
+ * ไม่เรียก claimConversation เพื่อหา groupId เพราะการ claim อาจไปทำให้ห้องนับว่าอ่านแล้ว
+ */
+async function markUnread(e, info) {
+  if (!MARK_UNREAD) return;
+  const groupId = await resolveGroupId(e, info);
+  if (!groupId) {
+    outRoom(e, info, { event: 'mark_unread', ok: false, error: 'หา groupId ไม่เจอ' });
+    return;
+  }
+  try {
+    await rt.markConversation({
+      conversationIDList: [`GROUP_${groupId}`],
+      markType: 2,                          // 1=ดาว · 2=ยังไม่อ่าน · 3=พับ
+      enableMark: true,
+    });
+    outRoom(e, info, { event: 'mark_unread', ok: true });
+  } catch (err) {
+    outRoom(e, info, { event: 'mark_unread', ok: false, error: err.message });
+  }
+}
+
+// ---- คิวงาน AI: ทำทีละห้อง เว้นจังหวะ ไม่ยิงรวดเดียว ----
+// เดิมตามเก็บห้องค้างยิง AI 20 ห้องติดกันจนโดน 429 quota (ทั้งลิมิตต่อนาทีและต่อวัน)
+// คิวนี้บังคับให้มีงาน AI แค่ 1 งานทำอยู่เสมอ และหน่วงระหว่างงานตาม AI_QUEUE_DELAY_MS
+const QUEUE_DELAY_MS = Number(process.env.AI_QUEUE_DELAY_MS || 4000);
+const QUEUE_MAX = Number(process.env.AI_QUEUE_MAX || 200);      // คิวยาวเกินนี้ทิ้งงานใหม่
+const RETRY_429_MAX = Number(process.env.AI_RETRY_429 || 2);    // โดนจำกัดโควตาแล้วลองใหม่กี่ครั้ง
+
+const aiQueue = [];
+let queueBusy = false;
+const seenInQueue = new Set();          // กันห้องเดิมเข้าคิวซ้ำระหว่างที่ยังไม่ได้ทำ
+
+const sleep = ms => new Promise(r => setTimeout(r, ms));
+const isRateLimit = err => err?.status === 429 || /429|quota|rate limit/i.test(err?.message ?? '');
+
+/** ย่อ error ยาว ๆ (429 ของ Google ยาวเป็นหน้า) ให้เหลือใจความ + ลิมิตที่ชนและเวลาที่ต้องรอ */
+function shortError(err) {
+  const m = String(err?.message ?? err);
+  const limit = /limit: (\d+)/.exec(m)?.[1];
+  const retry = /retry in ([\d.]+)s/i.exec(m)?.[1];
+  const quotaId = /"quotaId":"([^"]+)"/.exec(m)?.[1];
+  if (limit || retry) {
+    return [
+      'โควตาเต็ม',
+      limit ? `ลิมิต ${limit}` : '',
+      quotaId ? `(${quotaId})` : '',
+      retry ? `· ลองใหม่ใน ${Math.ceil(Number(retry))} วิ` : '',
+    ].filter(Boolean).join(' ');
+  }
+  return m.replace(/\s+/g, ' ').slice(0, 160);
+}
+
+/** เอาห้องเข้าคิวให้ AI จัดการ (ไม่ต้อง await — คิวจะทยอยทำเอง) */
+function enqueueRoom(e, info, note) {
+  const cid = e.conversationId;
+  if (seenInQueue.has(cid)) return;                 // อยู่ในคิวอยู่แล้ว
+  if (aiQueue.length >= QUEUE_MAX) {
+    out({ event: 'warn', what: 'คิว AI', error: `คิวเต็ม ${QUEUE_MAX} งาน — ข้ามห้อง ${cid}` });
+    return;
+  }
+  seenInQueue.add(cid);
+  aiQueue.push({ e, info, note });
+  runQueue();
+}
+
+async function runQueue() {
+  if (queueBusy) return;
+  queueBusy = true;
+  while (aiQueue.length) {
+    const { e, info, note } = aiQueue.shift();
+    seenInQueue.delete(e.conversationId);
+    if (note) outRoom(e, info, { ...note, queued: aiQueue.length });
+
+    for (let attempt = 0; attempt <= RETRY_429_MAX; attempt++) {
+      try {
+        const outcome = await aiRespond(e, info);
+        await applyOutcomeTag(e, info, outcome);
+        break;
+      } catch (err) {
+        if (isAuthError(err)) { relogin(); break; }
+        if (isRateLimit(err) && attempt < RETRY_429_MAX) {
+          const wait = QUEUE_DELAY_MS * (attempt + 1) * 5;      // ถอยรอนานขึ้นทุกครั้ง
+          outRoom(e, info, { event: 'rate_limited', waitMs: wait, attempt: attempt + 1 });
+          await sleep(wait);
+          continue;
+        }
+        out({ event: 'warn', what: 'คิว AI', error: shortError(err) });
+        if (isRateLimit(err)) await sendHolding(e);   // ลองใหม่หมดแล้วยังไม่ได้ → ตอบเบื้องต้นไว้ก่อน
+        break;
+      }
+    }
+    if (aiQueue.length) await sleep(QUEUE_DELAY_MS);
+  }
+  queueBusy = false;
 }
 
 /** ติดแท็กตามผลที่ AI จัดการห้องนั้น (ใช้ร่วมกันทั้งแชทเด้งและตอนตามเก็บห้องค้าง) */
@@ -392,14 +563,15 @@ async function applyOutcomeTag(e, info, outcome) {
   if (!AUTO_TAG) return;
   // ไม่ต้องตอบ (ร้านตอบไปแล้ว / ลูกค้าพิมพ์แค่ "ครับ" / สติกเกอร์) → ไม่ยุ่งกับแท็กเลย
   // ปล่อยแท็กเดิมของห้องไว้อย่างที่เจ้าหน้าที่ตั้งไว้ ห้ามติด "รอเจ้าหน้าที่" ทับเคสที่จบแล้ว
-  if (outcome === 'skipped') return;
-  if (outcome === 'sent' || outcome === 'suggested') {
-    await addConversationTag(e, info, aiTagId, AUTO_TAG_AI_NAME);
-    await removeConversationTag(e, info, autoTagId, AUTO_TAG_NAME);
-  } else {
-    // AI ข้าม/เคสละเอียดอ่อน/ปิด/พลาด → ให้เจ้าหน้าที่ตอบ
-    await addConversationTag(e, info, autoTagId, AUTO_TAG_NAME);
-  }
+  // แท็กเฉพาะเคสที่ต้องให้คนตามต่อจริง ๆ นอกนั้นปล่อยห้องไว้เฉย ๆ ไม่แตะแท็กเลย:
+  //   'skipped'          = มีคนตอบไปแล้ว / ลูกค้าพิมพ์แค่คำรับ
+  //   'sent'/'suggested' = AI ตอบจบเองได้ (รวมเคสส่งการ์ดสินค้าแล้วตอบรายละเอียดไป)
+  if (outcome === 'skipped' || outcome === 'sent' || outcome === 'suggested') return;
+
+  // เหลือแค่เคสละเอียดอ่อน (ส่งของผิด ของขาด เคลม คืนเงิน ร้องเรียน) หรือ AI ตอบไม่ได้
+  // ⚠ บอท "เพิ่มแท็กอย่างเดียว ห้ามลบ" — แม้แต่แท็กที่บอทติดเอง ให้เจ้าหน้าที่เป็นคนลบเท่านั้น
+  await addConversationTag(e, info, autoTagId, AUTO_TAG_NAME);
+  await markUnread(e, info);
 }
 
 /**
@@ -417,7 +589,7 @@ async function catchUpUnread() {
     rooms = (res?.list ?? []).filter(c => Number(c.unReadCount) > 0);
   } catch (err) {
     if (isAuthError(err)) relogin();
-    log(`${C.gray}${ts()}${C.reset} ${C.yellow}⚠️  ดึงห้องค้างไม่สำเร็จ:${C.reset} ${err.message}`);
+    out({ event: 'warn', what: 'ดึงห้องค้าง', error: err.message });
     return;
   }
 
@@ -429,19 +601,18 @@ async function catchUpUnread() {
     .slice(0, CATCHUP_LIMIT);
 
   if (!todo.length) return;
-  log(`${C.gray}${ts()}${C.reset} 📬 ${C.bold}ตามเก็บห้องค้าง ${todo.length} ห้อง${C.reset}${C.gray} (ยังไม่อ่านทั้งหมด ${rooms.length})${C.reset}`);
+  out({ event: 'catchup_start', rooms: todo.length, unreadTotal: rooms.length });
 
   for (const c of todo) {
     const e = { shopId: c.shopId, conversationId: c.conversationId, platform: c.platform };
     try {
       const info = await getConvInfo(e);
-      const pc = PLATFORM_COLOR[c.platform] ?? C.gray;
-      log(`${C.gray}${ts()}${C.reset} 📬 ${pc}${info.shopName ?? c.shopId}·${c.platform}${C.reset} ${C.bold}${C.cyan}${c.buyerNick ?? c.conversationId}${C.reset} ${C.gray}(ค้าง ${c.unReadCount} ข้อความ)${C.reset}`);
-      const outcome = await aiRespond(e, info);
-      await applyOutcomeTag(e, info, outcome);
+      // เข้าคิวแทนการเรียก AI ตรง ๆ — คิวจะทยอยทำทีละห้อง ไม่ยิงรวดเดียวจนโดนจำกัดโควตา
+      enqueueRoom(e, { ...info, buyerNick: c.buyerNick ?? info.buyerNick },
+        { event: 'catchup_room', unread: c.unReadCount });
     } catch (err) {
       if (isAuthError(err)) { relogin(); return; }
-      log(`${C.gray}          ↳ ${C.yellow}⚠️  ตามเก็บห้องนี้ไม่สำเร็จ:${C.reset} ${err.message}`);
+      out({ event: 'warn', what: 'ตามเก็บห้อง', error: err.message });
     }
   }
 }
@@ -454,7 +625,7 @@ async function sendProductCard(e, itemId) {
   const room = sentCards.get(e.conversationId) ?? new Map();
   const last = room.get(itemId);
   if (last && Date.now() - last < CARD_COOLDOWN_MS) {
-    log(`${C.gray}          ↳ 🛍  ${C.dim}การ์ด ${itemId} ส่งไปแล้วเมื่อกี้ ไม่ส่งซ้ำ${C.reset}`);
+    outRoom(e, null, { event: 'send_card', itemId, skipped: 'ส่งไปแล้วเมื่อกี้' });
     return;
   }
 
@@ -465,10 +636,10 @@ async function sendProductCard(e, itemId) {
     });
     room.set(itemId, Date.now());
     sentCards.set(e.conversationId, room);
-    log(`${C.gray}          ↳ 🛍  ${C.green}ส่งการ์ดสินค้าแล้ว:${C.reset} ${itemId}`);
+    outRoom(e, null, { event: 'send_card', itemId });
   } catch (err) {
     // ส่งการ์ดไม่ได้ไม่ใช่เรื่องคอขาดบาดตาย ข้อความหลักส่งไปแล้ว
-    log(`${C.gray}          ↳ 🛍  ${C.yellow}ส่งการ์ดสินค้าไม่สำเร็จ (${itemId}):${C.reset} ${err.message}`);
+    outRoom(e, null, { event: 'send_card', itemId, ok: false, error: err.message });
   }
 }
 
@@ -488,7 +659,7 @@ async function aiRespond(e, info) {
     const lastBuyerMsg = [...messages].reverse().find(m => m.fromAccountType === 1);
     const lastId = lastBuyerMsg?.messageId ?? lastBuyerMsg?.id;
     if (lastId && answeredMsgId.get(e.conversationId) === lastId) {
-      log(`${C.gray}          ↳ 🤖 ${C.dim}ตอบข้อความนี้ไปแล้ว ไม่ตอบซ้ำ${C.reset}`);
+      outRoom(e, info, { event: 'ai_skip', reason: 'ตอบข้อความนี้ไปแล้ว' });
       return 'skipped';
     }
     if (lastId) {
@@ -514,7 +685,7 @@ async function aiRespond(e, info) {
           time: m.createTime,
         })),
       });
-      log(`${C.gray}          ↳ 📥 ${C.yellow}เข้าคิวให้ Claude Code/คนตอบ${C.reset} (npm run inbox)`);
+      outRoom(e, info, { event: 'queued_inbox', note: 'npm run inbox' });
       await sendHolding(e);          // ตอบเบื้องต้นไปก่อน ระหว่างรอคนในคิวตอบจริง
       return 'staff';
     }
@@ -525,25 +696,26 @@ async function aiRespond(e, info) {
       platform: e.platform,
       buyerName: info.buyerNick,
       orderContext: await orderContextFor(e, info, messages),
+      myUid,                       // ให้ ai-bot แยกออกว่าข้อความฝั่งร้านเป็นของบอทเราเองไหม
     });
 
     // โชว์ token ที่ใช้ไป — cacheR=0 ตลอด แปลว่า prompt caching ไม่ติด (ดู AI_CACHE_TTL ใน .env)
     const u = ai.lastUsage?.();
     if (u) {
-      const web = u.searches ? ` ${C.yellow}ค้นเว็บ=${u.searches}${C.reset}${C.gray}` : '';
-      log(`${C.gray}          ↳ 🎫 in=${u.in} cacheW=${u.cacheWrite} cacheR=${u.cacheRead} out=${u.out}${web}${C.reset}`);
+
+      outRoom(e, info, { event: 'usage', in: u.in, cacheWrite: u.cacheWrite, cacheRead: u.cacheRead, out: u.out, webSearches: u.searches || 0 });
     }
 
     // ร้านตอบคำถามนี้ครบไปแล้ว (หรือลูกค้าพิมพ์แค่คำรับ) → เงียบไว้ทั้งข้อความและแท็ก
     // คืน 'skipped' ไม่ใช่ 'declined' เพราะ 'declined' จะไปติดแท็ก "รอเจ้าหน้าที่" ทับเคสที่จบไปแล้ว
     if (r.skip) {
-      log(`${C.gray}          ↳ 🤖 ${C.dim}AI ข้าม (${r.reason ?? 'ร้านตอบไปแล้ว'})${C.reset}`);
+      outRoom(e, info, { event: 'ai_skip', reason: r.reason ?? 'ร้านตอบไปแล้ว' });
       return 'skipped';
     }
 
     // ไม่มีร่างคำตอบเลย → อย่างน้อยต้องตอบเบื้องต้นให้ลูกค้า แล้วให้เจ้าหน้าที่ตามต่อ
     if (!r.reply) {
-      log(`${C.gray}          ↳ 🤖 ${C.dim}AI ร่างคำตอบไม่ได้ (${r.reason ?? 'ไม่มีคำตอบ'})${C.reset}`);
+      outRoom(e, info, { event: 'ai_reply', status: 'no_draft', reason: r.reason ?? 'ไม่มีคำตอบ' });
       await sendHolding(e);
       return 'staff';
     }
@@ -552,12 +724,12 @@ async function aiRespond(e, info) {
     if (r.needsStaff) {
       const why = r.reason ? ` ${C.dim}[${r.reason}]${C.reset}` : '';
       if (!ai.autoSend()) {
-        logLong(`${C.gray}          ↳ 🤖 ${C.yellow}ร่างคำตอบ${C.reset} ${C.dim}(ยังไม่ส่ง — ตั้ง AI_AUTO_SEND=true)${C.reset}${why}: `, r.reply);
+        outRoom(e, info, { event: 'ai_reply', status: 'draft_staff', note: 'ยังไม่ส่ง (AI_AUTO_SEND=false)', reason: r.reason, text: oneLine(r.reply) });
         return 'staff';
       }
       // ร่างมีข้อมูลที่ยืนยันไม่ได้ (เช่น แต่งตัวเลขเอง) → ห้ามส่งร่าง ส่งข้อความสำเร็จรูปแทน
       if (r.unsafe) {
-        logLong(`${C.gray}          ↳ 🤖 ${C.yellow}ไม่ส่งร่างนี้${C.reset}${why} ${C.dim}ร่างที่ทิ้งไว้ให้เจ้าหน้าที่:${C.reset} `, r.reply);
+        outRoom(e, info, { event: 'ai_reply', status: 'blocked', reason: r.reason, text: oneLine(r.reply) });
         await sendHolding(e);
         return 'staff';
       }
@@ -565,7 +737,7 @@ async function aiRespond(e, info) {
         shopId: e.shopId, conversationId: e.conversationId, platform: e.platform,
         text: r.reply, puid: myPuid,
       });
-      logLong(`${C.gray}          ↳ 🤖 ${C.green}ตอบเบื้องต้นแล้ว${C.reset} ${C.dim}(รอเจ้าหน้าที่ตามต่อ)${C.reset}${why}: `, r.reply);
+      outRoom(e, info, { event: 'ai_reply', status: 'sent_staff', reason: r.reason, text: oneLine(r.reply) });
       return 'staff';
     }
 
@@ -575,17 +747,20 @@ async function aiRespond(e, info) {
         shopId: e.shopId, conversationId: e.conversationId, platform: e.platform,
         text: r.reply, puid: myPuid,
       });
-      logLong(`${C.gray}          ↳ 🤖 ${C.green}AI ตอบแล้ว:${C.reset} `, r.reply);
+      outRoom(e, info, { event: 'ai_reply', status: 'sent', text: oneLine(r.reply), swapped: r.swapped?.length ? r.swapped : undefined });
       await sendProductCard(e, r.sendItemId);
       return 'sent';
     }
-    logLong(`${C.gray}          ↳ 🤖 ${C.yellow}AI แนะนำตอบ${C.reset} (ยังไม่ส่ง — ตั้ง AI_AUTO_SEND=true เพื่อส่งจริง): `, r.reply);
-    if (r.sendItemId) log(`${C.gray}          ↳ 🛍  ${C.dim}(ถ้าเปิด auto-send จะส่งการ์ดสินค้า ${r.sendItemId} ตามไปด้วย)${C.reset}`);
+    outRoom(e, info, { event: 'ai_reply', status: 'suggested', note: 'ยังไม่ส่ง (AI_AUTO_SEND=false)', text: oneLine(r.reply) });
+    if (r.sendItemId) outRoom(e, info, { event: 'send_card', itemId: r.sendItemId, skipped: 'AI_AUTO_SEND=false' });
     return 'suggested';
   } catch (err) {
     if (isAuthError(err)) { relogin(); return 'error'; }
-    log(`${C.gray}${ts()}${C.reset} ${C.yellow}⚠️  AI ร่างคำตอบไม่สำเร็จ:${C.reset} ${err.message}`);
-    await sendHolding(e);            // AI ล่ม/โควตาหมด ลูกค้าก็ยังต้องได้คำตอบเบื้องต้น
+    // โควตาหมด/ถูกจำกัดอัตรา → โยนต่อให้คิวจัดการ (ถอยรอแล้วลองใหม่)
+    // ห้ามส่งข้อความเบื้องต้นตรงนี้ ไม่งั้นลูกค้าจะได้ข้อความซ้ำตอนลองใหม่สำเร็จ
+    if (isRateLimit(err)) throw err;
+    out({ event: 'error', what: 'AI ร่างคำตอบ', error: shortError(err) });
+    await sendHolding(e);            // AI ล่ม ลูกค้าก็ยังต้องได้คำตอบเบื้องต้น
     return 'error';
   }
 }
@@ -593,7 +768,7 @@ async function aiRespond(e, info) {
 function wireEvents() {
   rt.on('state', s => {
     const icon = s.state === 'connected' ? '🟢' : s.state === 'reconnecting' ? '🟡' : '🔴';
-    log(`${C.gray}${ts()}${C.reset} ${icon} socket ${s.state}${s.reason ? ' — ' + s.reason : ''}`);
+    out({ event: 'socket', state: s.state, reason: s.reason || undefined });
   });
 
   rt.on('newMessage', async e => {
@@ -612,21 +787,20 @@ function wireEvents() {
         if (fromBuyer) sawBuyerMsg = true;
         if (ONLY_BUYER && !fromBuyer) continue;
 
-        const pc = PLATFORM_COLOR[e.platform] ?? C.gray;
-        const who = fromBuyer
-          ? `${C.bold}${C.cyan}${info.buyerNick ?? e.conversationId}${C.reset}`
-          : `${C.dim}ร้าน${C.reset}`;
-        const shop = `${pc}${info.shopName ?? e.shopId}·${e.platform}${C.reset}`;
 
-        logLong(`${C.gray}${ts()}${C.reset} ${fromBuyer ? '💬' : '↩️ '} ${shop} ${who}: `, describe(m));
 
-        if (fromBuyer && info.unReadCount) {
-          log(`${C.gray}          ↳ ยังไม่อ่าน ${info.unReadCount} · conversationId=${e.conversationId}${C.reset}`);
-        }
+        outRoom(e, info, {
+          event: 'message',
+          from: fromBuyer ? 'customer' : ai.shopSenderKind(m, myUid),   // shop: platform-bot | me | staff
+          sender: m.account ?? undefined,
+          type: m.messageType,
+          text: oneLine(describe(m)),
+          unread: info.unReadCount || 0,
+        });
 
         // ข้อมูลดิบทั้งก้อนที่ดึงมาได้ตอนลูกค้าทัก — ลงไฟล์ log อย่างเดียว ไม่รกจอ
         if (LOG_RAW) {
-          logFile(`          ↳ raw ${JSON.stringify({
+          logFile(`  ↳ raw ${JSON.stringify({
             event: e,
             conversation: {
               conversationId: e.conversationId, shopId: e.shopId, platform: e.platform,
@@ -640,17 +814,12 @@ function wireEvents() {
       }
 
       // มีข้อความจากลูกค้า → ให้ AI ตอบ/แนะนำก่อน (log ออกทันที) แล้วค่อยจัดการแท็ก
-      if (sawBuyerMsg) {
-        const outcome = await aiRespond(e, info);   // ข้างในจะ log คำตอบ/คำแนะนำก่อนคืนค่า
-        if (AUTO_TAG) {
-          // ไม่ต้องตอบ (ร้านตอบไปแล้ว / ลูกค้าพิมพ์แค่ "ครับ" / สติกเกอร์) → ไม่ยุ่งกับแท็กเลย
-          // ปล่อยแท็กเดิมของห้องไว้อย่างที่เจ้าหน้าที่ตั้งไว้ ห้ามติด "รอเจ้าหน้าที่" ทับเคสที่จบแล้ว
-          await applyOutcomeTag(e, info, outcome);
-        }
-      }
+      // เข้าคิวเหมือนกับตอนตามเก็บ เพื่อไม่ให้แชทเด้งหลายห้องพร้อมกันยิง AI ซ้อนกัน
+      // (การติดแท็กย้ายไปทำในคิวแล้ว ดู runQueue)
+      if (sawBuyerMsg) enqueueRoom(e, info);
     } catch (err) {
       if (isAuthError(err)) return relogin();
-      log(`${C.gray}${ts()}${C.reset} ${C.red}⚠️  ดึงข้อความไม่สำเร็จ:${C.reset} ${err.message}`);
+      out({ event: 'error', what: 'ดึงข้อความ', error: err.message });
     }
   });
 
@@ -669,7 +838,7 @@ function wireEvents() {
     process.exit(1);
   });
 
-  rt.on('error', err => log(`${C.red}⚠️  ${err.message}${C.reset}`));
+  rt.on('error', err => out({ event: 'error', error: err.message }));
 }
 
 async function connect(token) {
@@ -689,9 +858,9 @@ async function relogin() {
     clearCache();
     const s = await authenticate({ force: true });
     await connect(s.token);
-    log(`${C.gray}${ts()}${C.reset} ✅ ${C.green}กลับมาทำงานแล้ว${C.reset}`);
+    out({ event: 'relogin', state: 'ok' });
   } catch (err) {
-    log(`${C.red}❌ ล็อกอินใหม่ไม่สำเร็จ: ${err.message}${C.reset}`);
+    out({ event: 'relogin', state: 'failed', error: err.message });
     process.exit(1);
   } finally {
     reloggingIn = false;
@@ -705,48 +874,58 @@ await connect(session.token);
 
 const user = await api.getUser();
 myPuid = (user.user ?? user).puid ?? user.puid ?? session.puid;
+myUid = (user.user ?? user).id ?? user.uid ?? user.id ?? session.uid;
 const shops = await api.getShops();
+shopList = shops;                      // ให้ shopNameOf() แปลง shopId เป็นชื่อร้านได้
 
 // resolve tagId ของ "รอเจ้าหน้าที่" (เจอของเดิมก็ใช้เลย ไม่มีก็สร้างให้)
 if (AUTO_TAG) {
   try {
     autoTagId = await api.ensureTag({ tagName: AUTO_TAG_NAME });
-    if (!autoTagId) console.log(`${C.yellow}⚠️  หา/สร้างแท็ก “${AUTO_TAG_NAME}” ไม่ได้ — ปิดการติดแท็กอัตโนมัติ${C.reset}`);
+    if (!autoTagId) out({ event: 'warn', what: 'เตรียมแท็ก', tag: AUTO_TAG_NAME, error: 'หา/สร้างไม่ได้ — ปิดการติดแท็กอัตโนมัติ' });
     if (ai.isEnabled()) {
       aiTagId = await api.ensureTag({ tagName: AUTO_TAG_AI_NAME, tagColor: 'green' });
-      if (!aiTagId) console.log(`${C.yellow}⚠️  หา/สร้างแท็ก “${AUTO_TAG_AI_NAME}” ไม่ได้${C.reset}`);
+      if (!aiTagId) out({ event: 'warn', what: 'เตรียมแท็ก', tag: AUTO_TAG_AI_NAME, error: 'หา/สร้างไม่ได้' });
     }
     // แท็กเคสใบกำกับ — ทั้งสองอันมีอยู่แล้วในบัญชี ensureTag จะเจอของเดิม ไม่สร้างซ้ำ
+    // โหลดรายชื่อแท็กทั้งบัญชีไว้ เพื่อให้ log แสดงชื่อแท็กแทนตัวเลข id
+    try {
+      const all = await api.getTagList();
+      for (const g of (Array.isArray(all) ? all : (all?.list ?? []))) tagNameById.set(String(g.id), g.tagName);
+    } catch {}
     invoiceTagId = await api.ensureTag({ tagName: TAG_INVOICE_NAME, tagColor: 'green' });
     slipTagId = await api.ensureTag({ tagName: TAG_SLIP_NAME, tagColor: 'green' });
     if (!invoiceTagId || !slipTagId) {
-      console.log(`${C.yellow}⚠️  หาแท็กใบกำกับไม่ครบ (“${TAG_INVOICE_NAME}”/“${TAG_SLIP_NAME}”) — ข้ามการติดแท็กเคสใบกำกับ${C.reset}`);
+      out({ event: 'warn', what: 'เตรียมแท็กใบกำกับ', tags: [TAG_INVOICE_NAME, TAG_SLIP_NAME], error: 'หาไม่ครบ — ข้ามการติดแท็กเคสใบกำกับ' });
     }
   } catch (err) {
-    console.log(`${C.yellow}⚠️  เตรียมแท็กไม่สำเร็จ: ${err.message} — ปิดการติดแท็กอัตโนมัติ${C.reset}`);
+    out({ event: 'warn', what: 'เตรียมแท็ก', error: err.message });
   }
 }
 
-console.log(`\n${C.bold}Duoke chat watcher${C.reset}`);
-console.log(`${C.dim}บัญชี:${C.reset} ${user.email ?? user.account ?? user.uid}`);
-console.log(`${C.dim}ร้าน :${C.reset} ${shops.map(s => `${s.shopName}(${s.platform})`).join(', ')}`);
-console.log(`${C.dim}กรอง :${C.reset} ${ONLY_BUYER ? 'เฉพาะข้อความจากลูกค้า' : 'ทุกข้อความ'}${LOG_FILE ? ` · เขียนลง ${path.basename(LOG_FILE)}` : ''}`);
-console.log(`${C.dim}แท็ก :${C.reset} ${AUTO_TAG && autoTagId ? `AI ตอบ→“${AUTO_TAG_AI_NAME}” · ที่เหลือ→“${AUTO_TAG_NAME}”` : 'ปิด'}`);
-if (ai.isEnabled()) {
+{
   const kb = ai.knowledgeInfo();
   const p = ai.providerInfo();
-  const mode = ai.autoSend() ? `${C.green}ตอบอัตโนมัติ (ส่งจริง)${C.reset}` : `${C.yellow}แนะนำคำตอบเท่านั้น (ยังไม่ส่ง)${C.reset}`;
-  console.log(`${C.dim}AI   :${C.reset} เปิด — ${mode} · ${p.provider}/${p.model} · ข้อมูล ${kb.count} ไฟล์ใน ${path.basename(kb.dir)}/`);
-} else {
-  console.log(`${C.dim}AI   :${C.reset} ปิด`);
+  out({
+    event: 'ready',
+    account: user.email ?? user.account ?? user.uid,
+    shops: shops.map(s => ({ name: s.shopName, platform: s.platform })),
+    onlyBuyer: ONLY_BUYER,
+    logFile: LOG_FILE ? path.basename(LOG_FILE) : null,
+    tag: AUTO_TAG && autoTagId
+      ? { sensitiveOnly: AUTO_TAG_NAME, markUnread: MARK_UNREAD }
+      : null,
+    ai: ai.isEnabled()
+      ? { autoSend: ai.autoSend(), provider: p.provider, model: p.model, knowledgeFiles: kb.count, warning: p.warning }
+      : null,
+    catchup: CATCHUP && ai.isEnabled()
+      ? { days: CATCHUP_DAYS, limit: CATCHUP_LIMIT, everyMin: CATCHUP_EVERY_MIN }
+      : null,
+  });
 }
-console.log(C.dim + '─'.repeat(70) + C.reset);
-log(`${C.gray}${ts()}${C.reset} ✅ ${C.green}พร้อมรับแชท${C.reset} — Ctrl+C เพื่อออก`);
 
 // ตามเก็บห้องที่ค้างอยู่ก่อนบอทออนไลน์ แล้ววนซ้ำเป็นระยะ (เผื่อแชทเด้งหลุด)
 if (CATCHUP && ai.isEnabled()) {
-  console.log(`${C.dim}ตามเก็บ:${C.reset} ห้องที่ยังไม่อ่านย้อนหลัง ${CATCHUP_DAYS} วัน · สูงสุด ${CATCHUP_LIMIT} ห้อง/รอบ` +
-    (CATCHUP_EVERY_MIN > 0 ? ` · ซ้ำทุก ${CATCHUP_EVERY_MIN} นาที` : ' · ครั้งเดียวตอนเริ่ม'));
   await catchUpUnread();
   if (CATCHUP_EVERY_MIN > 0) {
     setInterval(() => { catchUpUnread().catch(() => {}); }, CATCHUP_EVERY_MIN * 60_000).unref();

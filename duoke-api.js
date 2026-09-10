@@ -348,13 +348,22 @@ export class DuokeApi {
    * @param {string[]} [p.currentTagIds] tagIdList เดิม ถ้ามีอยู่แล้วส่งมาเลยจะเร็วกว่า
    */
   async addTagToConversation({ shopId, conversationId, platform, tagId, currentTagIds }) {
-    let existing = currentTagIds;
-    if (!existing) {
-      const conv = await this.viewConversation({ shopId, conversationId, platform });
-      existing = conv?.tagIdList || conv?.dkConversationVO?.tagIdList || [];
+    // ⚠ updateConversationTag เขียนทับรายการแท็กทั้งชุด ไม่ใช่การเพิ่มทีละอัน
+    // จึงต้องอ่านของสดจากเซิร์ฟเวอร์เสมอ ห้ามเชื่อรายการที่ผู้เรียกแคชไว้
+    // ไม่งั้นแท็กที่เจ้าหน้าที่เพิ่งติดในเว็บ Duoke จะถูกลบทิ้งไปด้วย
+    const conv = await this.viewConversation({ shopId, conversationId, platform });
+    const live = conv?.tagIdList || conv?.dkConversationVO?.tagIdList || [];
+    if (live.includes(tagId)) return live;               // มีอยู่แล้ว ไม่ต้องเขียนอะไร
+
+    // รวมของสดกับที่ผู้เรียกส่งมา (เผื่อผู้เรียกรู้แท็กที่เพิ่งติดแต่เซิร์ฟเวอร์ยังไม่อัปเดต)
+    const tagIdList = [...new Set([...live, ...(currentTagIds ?? []), tagId])];
+
+    // การ์ดกันเผลอลบ: รายการใหม่ต้องมีแท็กเดิมครบทุกตัว ไม่งั้นแปลว่ากำลังจะลบของใครบางคน
+    const missing = live.filter(t => !tagIdList.includes(t));
+    if (missing.length) {
+      throw new Error(`ปฏิเสธการเขียนแท็ก: จะทำให้แท็กเดิมหาย ${missing.length} ตัว (${missing.join(', ')})`);
     }
-    if (existing.includes(tagId)) return existing;
-    const tagIdList = [...existing, tagId];
+
     await this.updateConversationTag({ shopId, conversationId, tagIdList });
     return tagIdList;
   }
