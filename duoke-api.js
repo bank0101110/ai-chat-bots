@@ -351,19 +351,35 @@ export class DuokeApi {
     // ⚠ updateConversationTag เขียนทับรายการแท็กทั้งชุด ไม่ใช่การเพิ่มทีละอัน
     // จึงต้องอ่านของสดจากเซิร์ฟเวอร์เสมอ ห้ามเชื่อรายการที่ผู้เรียกแคชไว้
     // ไม่งั้นแท็กที่เจ้าหน้าที่เพิ่งติดในเว็บ Duoke จะถูกลบทิ้งไปด้วย
-    const conv = await this.viewConversation({ shopId, conversationId, platform });
-    const live = conv?.tagIdList || conv?.dkConversationVO?.tagIdList || [];
-    if (live.includes(tagId)) return live;               // มีอยู่แล้ว ไม่ต้องเขียนอะไร
+    // แหล่งที่ 1: viewConversation
+    // ⚠ API ตัวนี้ "ไม่คืนบางฟิลด์" (พิสูจน์แล้วว่าไม่คืน groupId และ buyerNick)
+    // ถ้ามันไม่คืน tagIdList มาด้วย แล้วเราตีความว่า "ห้องนี้ไม่มีแท็ก" จะเขียนทับจนแท็กหายหมด
+    // จึงแยกให้ชัดระหว่าง "ไม่มีแท็ก" (array ว่าง) กับ "อ่านไม่ได้" (ไม่มีฟิลด์ = null)
+    const conv = await this.viewConversation({ shopId, conversationId, platform }).catch(() => null);
+    const raw = conv?.tagIdList ?? conv?.dkConversationVO?.tagIdList;
+    let fromView = Array.isArray(raw) ? raw : null;
 
-    // รวมของสดกับที่ผู้เรียกส่งมา (เผื่อผู้เรียกรู้แท็กที่เพิ่งติดแต่เซิร์ฟเวอร์ยังไม่อัปเดต)
-    const tagIdList = [...new Set([...live, ...(currentTagIds ?? []), tagId])];
-
-    // การ์ดกันเผลอลบ: รายการใหม่ต้องมีแท็กเดิมครบทุกตัว ไม่งั้นแปลว่ากำลังจะลบของใครบางคน
-    const missing = live.filter(t => !tagIdList.includes(t));
-    if (missing.length) {
-      throw new Error(`ปฏิเสธการเขียนแท็ก: จะทำให้แท็กเดิมหาย ${missing.length} ตัว (${missing.join(', ')})`);
+    // แหล่งที่ 2: queryConversationList — ยืนยันแล้วว่าคืน tagIdList จริง
+    // ใช้เมื่อแหล่งแรกอ่านไม่ได้ หรืออ่านได้แต่ว่าง (เผื่อว่างเพราะ API ไม่คืน ไม่ใช่เพราะไม่มีแท็ก)
+    let fromList = null;
+    if (!fromView || fromView.length === 0) {
+      try {
+        const res = await this.queryConversationList({ shopIdList: [shopId], size: 200, offset: 0 });
+        const row = (res?.list ?? []).find(c => String(c.conversationId) === String(conversationId));
+        if (Array.isArray(row?.tagIdList)) fromList = row.tagIdList;
+      } catch { /* อ่านไม่ได้ก็ปล่อยเป็น null */ }
     }
 
+    const sources = [fromView, fromList, currentTagIds].filter(Array.isArray);
+    if (!sources.length) {
+      throw new Error('อ่านรายการแท็กเดิมของห้องไม่ได้จากแหล่งใดเลย — ไม่เขียนทับ เพื่อกันแท็กของเจ้าหน้าที่หาย');
+    }
+
+    // รวมทุกแหล่ง ไม่เคยตัดออก — บอทมีหน้าที่ "เพิ่ม" อย่างเดียว
+    const existing = [...new Set(sources.flat())];
+    if (existing.includes(tagId)) return existing;       // มีอยู่แล้ว ไม่ต้องเขียนอะไร
+
+    const tagIdList = [...new Set([...existing, tagId])];
     await this.updateConversationTag({ shopId, conversationId, tagIdList });
     return tagIdList;
   }

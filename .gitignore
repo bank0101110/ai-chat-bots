@@ -8,3 +8,5 @@ captcha.jpg
 inbox/
 .cache/
 .chrome-shopee/
+.handled.json
+.answered.json

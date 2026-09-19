@@ -35,6 +35,8 @@ import { DuokeRealtime } from './duoke-realtime.js';
 import { getSession, clearCache } from './duoke-session.js';
 import * as ai from './ai-bot.js';
 import { writeInbox } from './inbox-store.js';
+import { collectAdminExamples } from './admin-examples.js';
+import { waitingForStaff } from './waiting-staff.js';
 
 const __dirname = path.dirname(fileURLToPath(import.meta.url));
 
@@ -53,7 +55,8 @@ const AUTO_TAG_AI_NAME = process.env.AUTO_TAG_AI_NAME || 'AI ตอบ';
 // ห้องที่ AI ตอบไม่เคลียร์ ทำเป็น "ยังไม่อ่าน" ให้เจ้าหน้าที่เห็นค้างในลิสต์
 const MARK_UNREAD = (process.env.MARK_UNREAD_ON_STAFF ?? 'true') !== 'false';
 const CATCHUP = (process.env.CATCHUP_UNREAD ?? 'true') !== 'false';
-const CATCHUP_LIMIT = Number(process.env.CATCHUP_LIMIT || 20);      // ตอบได้สูงสุดกี่ห้องต่อรอบ
+const CATCHUP_LIMIT = Number(process.env.CATCHUP_LIMIT || 100);     // ตอบได้สูงสุดกี่ห้องต่อรอบ
+const CATCHUP_PAGES = Number(process.env.CATCHUP_PAGES || 10);      // ไล่รายการห้องได้กี่หน้า (หน้าละ 100)
 const CATCHUP_DAYS = Number(process.env.CATCHUP_DAYS || 3);         // ย้อนหลังไม่เกินกี่วัน
 const CATCHUP_EVERY_MIN = Number(process.env.CATCHUP_EVERY_MIN || 15); // วนซ้ำทุกกี่นาที (0=ครั้งเดียว)
 
@@ -63,7 +66,8 @@ const TAG_SLIP_NAME = process.env.AUTO_TAG_SLIP_NAME || 'ขอสลิปอ�
 // ห้องเดิมส่ง "คำตอบเบื้องต้น" ซ้ำได้เร็วสุดกี่นาที (ลูกค้ามักพิมพ์รัวหลายข้อความติดกัน)
 const CARD_COOLDOWN_MS = Number(process.env.AI_CARD_COOLDOWN_MIN || 60) * 60_000;
 const HOLDING_COOLDOWN_MS = Number(process.env.AI_HOLDING_COOLDOWN_MIN || 30) * 60_000;
-const LOG_FILE = process.env.LOG_FILE ? path.join(__dirname, process.env.LOG_FILE) : null;
+// Console only: ignore legacy LOG_FILE settings. State/deduplication files are separate.
+const LOG_FILE = null;
 // ในไฟล์ log เก็บข้อความเต็มเสมอ (ไม่ตัด …) ส่วนบนจอย่อให้อ่านง่ายตาม LOG_CONSOLE_MAX
 const LOG_CONSOLE_MAX = Number(process.env.LOG_CONSOLE_MAX || 160);
 // เขียน JSON ดิบของทุกข้อความ + ข้อมูลห้องแชทลงไฟล์ log ด้วย (ปิดด้วย LOG_RAW=false)
@@ -115,9 +119,8 @@ function ts() {
 
 /** พิมพ์ 1 อีเวนต์ */
 function out(obj) {
-  const line = JSON.stringify({ time: ts(), ...obj });
+  const line = JSON.stringify({ time: ts(), ...obj }, null, obj.event === 'ai_reply' ? 2 : undefined);
   console.log(line);
-  if (LOG_FILE) fs.appendFile(LOG_FILE, `${line}\n`, () => {});
 }
 
 // viewConversation ไม่คืน buyerNick มาให้ (ชื่อลูกค้ามาจากลิสต์ห้องหรือ socket เท่านั้น)
@@ -134,19 +137,22 @@ function outRoom(e, info, obj) {
     platform: e?.platform,
     buyer: buyerNames.get(cid) ?? cid,
     conversationId: cid,
+    replyTo: e?.replyTo,
+    result: obj.event === 'ai_reply' ? ({
+      sent: 'ส่งคำตอบแล้ว', sent_staff: 'ส่งคำตอบแล้ว รอเจ้าหน้าที่ดูต่อ',
+      suggested: 'ร่างเท่านั้น ยังไม่ได้ส่ง', draft_staff: 'ร่างเท่านั้น รอเจ้าหน้าที่',
+      blocked: 'ไม่ส่งร่าง ข้อมูลยังยืนยันไม่ได้', no_draft: 'ยังไม่มีร่างคำตอบ',
+    }[obj.status] ?? obj.status) : undefined,
     ...obj,
   });
 }
 
 function log(line, plain = null) {
   console.log(line);
-  if (LOG_FILE) fs.appendFile(LOG_FILE, `${plain ?? stripAnsi(line)}\n`, () => {});
 }
 
 /** เขียนลงไฟล์ log อย่างเดียว ไม่ขึ้นจอ (ใช้กับ JSON ดิบที่ยาวมาก) */
-function logFile(text) {
-  if (LOG_FILE) fs.appendFile(LOG_FILE, `${text}\n`, () => {});
-}
+function logFile(_text) {} // Legacy raw-log callers intentionally do not persist chat data.
 
 /**
  * log บรรทัดที่มีเนื้อความยาว — บนจอย่อให้พอดีตา แต่ในไฟล์เก็บเต็มไม่ตัด
@@ -265,8 +271,61 @@ const isAuthError = err => err?.code === 401 || err?.code === 403 || /401|403/.t
 
 const convCache = new Map();        // conversationId -> conversation object
 const seenMessageIds = new Set();   // กัน log ซ้ำ
-const answeredMsgId = new Map();    // conversationId → messageId ล่าสุดของลูกค้าที่ตอบไปแล้ว (กันตอบซ้ำ)
+// conversationId → messageId ล่าสุดของลูกค้าที่ตอบไปแล้ว (กันตอบซ้ำ)
+// เก็บลงไฟล์ด้วย — บอทยอมตอบต่อจากข้อความของบอทเอง ถ้ารีสตาร์ตแล้วลืม จะตอบคำถามเดิมซ้ำ
+const ANSWERED_FILE = path.join(__dirname, '.answered.json');
+let answeredMsgId = new Map();
+try {
+  answeredMsgId = new Map(Object.entries(JSON.parse(fs.readFileSync(ANSWERED_FILE, 'utf8'))));
+} catch { /* ไฟล์ยังไม่มี */ }
+let answeredDirty = false;
+
+// ---- จำว่าห้องไหนจัดการไปแล้วถึงเมื่อไหร่ (เก็บลงไฟล์) ----
+// ⚠ เดิมจำในหน่วยความจำอย่างเดียว พอรีสตาร์ตบอทก็ลืมหมด แล้วไล่ตอบห้องเก่าซ้ำทั้งหมด
+// ยิ่งบอทเป็นคนทำห้องให้เป็น "ยังไม่อ่าน" เอง ห้องนั้นจะถูกหยิบมาใหม่ทุกรอบไม่รู้จบ
+// เก็บเป็น conversationId → เวลาที่จัดการล่าสุด แล้วข้ามห้องที่ไม่มีข้อความใหม่กว่านั้น
+const HANDLED_FILE = path.join(__dirname, '.handled.json');
+let handledAt = new Map();
+try {
+  const raw = JSON.parse(fs.readFileSync(HANDLED_FILE, 'utf8'));
+  handledAt = new Map(Object.entries(raw));
+} catch { /* ไฟล์ยังไม่มี = เริ่มใหม่ */ }
+
+let handledDirty = false;
+function markHandled(conversationId) {
+  handledAt.set(conversationId, Date.now());
+  handledDirty = true;
+}
+/** เขียนลงไฟล์เป็นระยะ + ตัดของเก่าที่พ้นช่วงตามเก็บไปแล้ว */
+function saveHandled() {
+  if (!handledDirty) return;
+  handledDirty = false;
+  const cutoff = Date.now() - CATCHUP_DAYS * 86400_000;
+  for (const [k, v] of handledAt) if (v < cutoff) handledAt.delete(k);
+  fs.writeFile(HANDLED_FILE, JSON.stringify(Object.fromEntries(handledAt)), () => {});
+}
+function saveAnswered() {
+  if (!answeredDirty) return;
+  answeredDirty = false;
+  fs.writeFile(ANSWERED_FILE, JSON.stringify(Object.fromEntries(answeredMsgId)), () => {});
+}
+setInterval(saveAnswered, 30_000).unref();
+setInterval(saveHandled, 30_000).unref();
 const sentCards = new Map();        // conversationId → Map(itemId → เวลาที่ส่ง) กันส่งการ์ดสินค้าซ้ำ
+// แคชออร์เดอร์สั้น ๆ ต่อห้อง — เดิม tagInvoiceCase กับ orderContextFor ยิง getOrderList คนละครั้ง
+// ทั้งที่เป็นข้อมูลชุดเดียวกัน ทำให้ช้าและเปลือง API เปล่า ๆ
+const orderCache = new Map();       // conversationId → { at, list }
+const ORDER_CACHE_MS = 60_000;
+async function ordersFor(e, buyerId) {
+  if (!buyerId) return [];
+  const hit = orderCache.get(e.conversationId);
+  if (hit && Date.now() - hit.at < ORDER_CACHE_MS) return hit.list;
+  const res = await api.getOrderList({ shopId: e.shopId, buyerId, platform: e.platform, pageSize: 5 });
+  const list = res?.list ?? [];
+  orderCache.set(e.conversationId, { at: Date.now(), list });
+  if (orderCache.size > 500) orderCache.clear();
+  return list;
+}
 const holdingSentAt = new Map();    // conversationId -> เวลาที่ส่ง "คำตอบเบื้องต้น" ล่าสุด (กันส่งซ้ำ)
 let api = null;
 let rt = null;
@@ -344,8 +403,23 @@ async function addConversationTag(e, info, tagId, label) {
 // ส่ง "คำตอบเบื้องต้น" ให้ลูกค้าตอนที่ยังไม่มีคำตอบที่ส่งได้จริง (เคสละเอียดอ่อนที่ร่างยืนยันไม่ได้ /
 // AI ร่างไม่ได้ / โหมดคิวรอคนตอบ) — ลูกค้าจะได้ไม่เงียบระหว่างรอเจ้าหน้าที่
 // กันสแปม: ห้องหนึ่งส่งได้ครั้งเดียวต่อ HOLDING_COOLDOWN_MS (ลูกค้ามักพิมพ์รัวหลายข้อความติดกัน)
+async function skipWaitingStaff(e, info) {
+  try {
+    const ids = [...tagNameById].filter(([, name]) => name === AUTO_TAG_NAME || name === 'รอเจ้าหน้าที่').map(([id]) => id);
+    if (autoTagId) ids.push(autoTagId);
+    if (!await waitingForStaff(api, { shopId: e.shopId, conversationId: e.conversationId, platform: e.platform }, AUTO_TAG_NAME, ids)) return false;
+    outRoom(e, info, { event: 'ai_skip', reason: 'ติดแท็กรอเจ้าหน้าที่แล้ว', tag: AUTO_TAG_NAME });
+  } catch (err) {
+    outRoom(e, info, { event: 'ai_skip', reason: 'ตรวจแท็กไม่ได้ พักการตอบก่อน', error: shortError(err) });
+  }
+  return true;
+}
+
 async function sendHolding(e) {
   if (!ai.autoSend()) return false;
+  if (await skipWaitingStaff(e)) return false;
+  const current = await api.getMessageList({ ...e, pageNo: 1, pageSize: 30 });
+  if (!current?.list?.length || humanAfterBuyer(current.list.slice().reverse())) return false;
   const text = ai.holdingMessage();
   if (!text) return false;
 
@@ -388,8 +462,7 @@ async function orderContextFor(e, info, messages) {
   }
 
   try {
-    const res = await api.getOrderList({ shopId: e.shopId, buyerId, platform: e.platform, pageSize: 5 });
-    const list = res?.list ?? [];
+    const list = await ordersFor(e, buyerId);
     const text = ai.formatOrders(list);
     if (text) outRoom(e, info, { event: 'order_context', orders: list.length });
     return text;
@@ -420,8 +493,7 @@ async function tagInvoiceCase(e, info, messages) {
   const buyerId = info.buyerId ?? info.dkConversationVO?.buyerId;
   if (buyerId) {
     try {
-      const res = await api.getOrderList({ shopId: e.shopId, buyerId, platform: e.platform, pageSize: 5 });
-      orders = res?.list ?? [];
+      orders = await ordersFor(e, buyerId);
     } catch { /* ดึงไม่ได้ก็ใช้ยอดที่ลูกค้าพิมพ์แทน */ }
   }
 
@@ -486,12 +558,13 @@ async function markUnread(e, info) {
 // ---- คิวงาน AI: ทำทีละห้อง เว้นจังหวะ ไม่ยิงรวดเดียว ----
 // เดิมตามเก็บห้องค้างยิง AI 20 ห้องติดกันจนโดน 429 quota (ทั้งลิมิตต่อนาทีและต่อวัน)
 // คิวนี้บังคับให้มีงาน AI แค่ 1 งานทำอยู่เสมอ และหน่วงระหว่างงานตาม AI_QUEUE_DELAY_MS
-const QUEUE_DELAY_MS = Number(process.env.AI_QUEUE_DELAY_MS || 4000);
+const QUEUE_DELAY_MS = Number(process.env.AI_QUEUE_DELAY_MS || 1500);
 const QUEUE_MAX = Number(process.env.AI_QUEUE_MAX || 200);      // คิวยาวเกินนี้ทิ้งงานใหม่
 const RETRY_429_MAX = Number(process.env.AI_RETRY_429 || 2);    // โดนจำกัดโควตาแล้วลองใหม่กี่ครั้ง
 
 const aiQueue = [];
-let queueBusy = false;
+const activeRooms = new Set();
+const pendingLive = new Map();
 const seenInQueue = new Set();          // กันห้องเดิมเข้าคิวซ้ำระหว่างที่ยังไม่ได้ทำ
 
 const sleep = ms => new Promise(r => setTimeout(r, ms));
@@ -514,31 +587,82 @@ function shortError(err) {
   return m.replace(/\s+/g, ' ').slice(0, 160);
 }
 
-/** เอาห้องเข้าคิวให้ AI จัดการ (ไม่ต้อง await — คิวจะทยอยทำเอง) */
-function enqueueRoom(e, info, note) {
+/**
+ * เอาห้องเข้าคิวให้ AI จัดการ (ไม่ต้อง await — คิวจะทยอยทำเอง)
+ * live=true คือลูกค้าเพิ่งทักเข้ามาสด ๆ → แทรกหน้าคิวและไม่ต้องหน่วง
+ * เพราะถ้าต่อท้ายหลังห้องค้าง 20 ห้อง ลูกค้าจะรอเป็นนาที
+ */
+function enqueueRoom(e, info, note, live = false) {
   const cid = e.conversationId;
+  if (activeRooms.has(cid)) {
+    if (live) pendingLive.set(cid, { e, info, note });
+    return;
+  }
+  const queued = aiQueue.findIndex(j => j.e.conversationId === cid);
+  if (queued >= 0 && live) {
+    const [job] = aiQueue.splice(queued, 1);
+    Object.assign(job, { e, info, note, live: true });
+    const at = aiQueue.findIndex(j => !j.live);
+    aiQueue.splice(at < 0 ? aiQueue.length : at, 0, job);
+    runQueue();
+    return;
+  }
   if (seenInQueue.has(cid)) return;                 // อยู่ในคิวอยู่แล้ว
   if (aiQueue.length >= QUEUE_MAX) {
     out({ event: 'warn', what: 'คิว AI', error: `คิวเต็ม ${QUEUE_MAX} งาน — ข้ามห้อง ${cid}` });
     return;
   }
   seenInQueue.add(cid);
-  aiQueue.push({ e, info, note });
+  const job = { e, info, note, live };
+  if (live) {
+    // แทรกต่อจากงาน live ที่รออยู่ แต่อยู่หน้างานตามเก็บทั้งหมด
+    const at = aiQueue.findIndex(j => !j.live);
+    if (at < 0) aiQueue.push(job); else aiQueue.splice(at, 0, job);
+  } else {
+    aiQueue.push(job);
+  }
   runQueue();
 }
 
-async function runQueue() {
-  if (queueBusy) return;
-  queueBusy = true;
-  while (aiQueue.length) {
-    const { e, info, note } = aiQueue.shift();
-    seenInQueue.delete(e.conversationId);
+// ทำพร้อมกันหลายห้อง (เดิมทีละห้อง 20 ห้องใช้ ~2 นาที) — ลิมิตต่อนาทีของ Gemini ยังรับไหว
+// ถ้าเจอ rate_limited บ่อยให้ลด AI_QUEUE_CONCURRENCY ลง
+const QUEUE_CONCURRENCY = Math.max(1, Number(process.env.AI_QUEUE_CONCURRENCY || 3));
+let activeWorkers = 0;
+let activeBackground = 0;
+
+function runQueue() {
+  while (activeWorkers < QUEUE_CONCURRENCY && aiQueue.length) {
+    const index = aiQueue.findIndex(j => j.live || activeBackground === 0);
+    if (index < 0) break;
+    const [job] = aiQueue.splice(index, 1);
+    activeRooms.add(job.e.conversationId);
+    if (!job.live) activeBackground++;
+    activeWorkers++;
+    queueWorker(job).catch(err => {
+      outRoom(job.e, job.info, { event: 'error', what: 'queue_worker', error: shortError(err) });
+    }).finally(() => {
+      activeWorkers--;
+      if (!job.live) activeBackground--;
+      activeRooms.delete(job.e.conversationId);
+      seenInQueue.delete(job.e.conversationId);
+      const pending = pendingLive.get(job.e.conversationId);
+      pendingLive.delete(job.e.conversationId);
+      if (pending) enqueueRoom(pending.e, pending.info, pending.note, true);
+      if (aiQueue.length) runQueue();
+    });
+  }
+}
+
+async function queueWorker({ e, info, note, live }) {
     if (note) outRoom(e, info, { ...note, queued: aiQueue.length });
 
     for (let attempt = 0; attempt <= RETRY_429_MAX; attempt++) {
       try {
         const outcome = await aiRespond(e, info);
         await applyOutcomeTag(e, info, outcome);
+        // จดว่าจัดการแล้ว "เฉพาะตอนทำเสร็จจริง" — เดิมจดตั้งแต่ก่อนเริ่ม
+        // ทำให้ห้องที่โดนโควตาเต็ม/พลาด ถูกนับว่าเสร็จแล้วและไม่มีวันถูกหยิบมาตอบอีก
+        if (outcome !== 'error' && outcome !== 'stale') markHandled(e.conversationId);
         break;
       } catch (err) {
         if (isAuthError(err)) { relogin(); break; }
@@ -553,13 +677,15 @@ async function runQueue() {
         break;
       }
     }
-    if (aiQueue.length) await sleep(QUEUE_DELAY_MS);
-  }
-  queueBusy = false;
+    // หน่วงเฉพาะตอนไล่ห้องค้าง (กันชนลิมิตต่อนาที) ส่วนงานสดปล่อยให้ต่อเนื่อง
+    // ถ้างานถัดไปเป็นงานสด ก็ไม่ต้องหน่วงเช่นกัน — ลูกค้ากำลังรออยู่
+    const nextIsLive = aiQueue[0]?.live;
+    if (aiQueue.length && !live && !nextIsLive) await sleep(QUEUE_DELAY_MS);
 }
 
 /** ติดแท็กตามผลที่ AI จัดการห้องนั้น (ใช้ร่วมกันทั้งแชทเด้งและตอนตามเก็บห้องค้าง) */
 async function applyOutcomeTag(e, info, outcome) {
+  if (outcome === 'stale' || outcome === 'error' || outcome === 'disabled') return;
   if (!AUTO_TAG) return;
   // ไม่ต้องตอบ (ร้านตอบไปแล้ว / ลูกค้าพิมพ์แค่ "ครับ" / สติกเกอร์) → ไม่ยุ่งกับแท็กเลย
   // ปล่อยแท็กเดิมของห้องไว้อย่างที่เจ้าหน้าที่ตั้งไว้ ห้ามติด "รอเจ้าหน้าที่" ทับเคสที่จบแล้ว
@@ -567,6 +693,8 @@ async function applyOutcomeTag(e, info, outcome) {
   //   'skipped'          = มีคนตอบไปแล้ว / ลูกค้าพิมพ์แค่คำรับ
   //   'sent'/'suggested' = AI ตอบจบเองได้ (รวมเคสส่งการ์ดสินค้าแล้วตอบรายละเอียดไป)
   if (outcome === 'skipped' || outcome === 'sent' || outcome === 'suggested') return;
+  const latest = await api.getMessageList({ ...e, pageNo: 1, pageSize: 30 });
+  if (!latest?.list?.length || humanAfterBuyer(latest.list.slice().reverse())) return;
 
   // เหลือแค่เคสละเอียดอ่อน (ส่งของผิด ของขาด เคลม คืนเงิน ร้องเรียน) หรือ AI ตอบไม่ได้
   // ⚠ บอท "เพิ่มแท็กอย่างเดียว ห้ามลบ" — แม้แต่แท็กที่บอทติดเอง ให้เจ้าหน้าที่เป็นคนลบเท่านั้น
@@ -579,47 +707,90 @@ async function applyOutcomeTag(e, info, outcome) {
  * แชทเด้ง (socket) จับได้เฉพาะข้อความที่เข้ามาตอนบอทออนไลน์ ห้องที่ค้างมาก่อนหน้าจะตกหล่น
  * รันตอนเริ่มระบบ และซ้ำทุก CATCHUP_EVERY_MIN นาที
  */
+/**
+ * ห้องนี้ "ยังรอคำตอบ" ไหม — ดูจากฟิลด์ในรายการห้อง ไม่ต้องดึงข้อความทีละห้อง
+ * ⚠ เดิมดูแค่ unReadCount > 0 ซึ่งพลาดหนัก: ข้อมูลจริง 100 ห้องเป็น 0 ทั้งหมด
+ *   เพราะแค่มีคนเปิดดูในเว็บ Duoke ห้องก็กลายเป็น "อ่านแล้ว" ทั้งที่ยังไม่มีใครตอบ
+ * สัญญาณที่ใช้ (ตรวจกับข้อความจริงแล้ว):
+ *   noReplyBuyerMessageTime มีค่า     → ลูกค้าพูดล่าสุด ยังไม่มีใครตอบ
+ *   latestSellerMessageSourceType = 1 → ข้อความร้านล่าสุดเป็นบอทแพลตฟอร์ม ไม่ใช่แอดมิน
+ *   unReadCount > 0                   → ยังไม่มีใครเปิดอ่าน
+ * ส่วนที่คลุมเครือ ai-bot.js จะเช็คซ้ำจากข้อความจริงอีกชั้น (มีแอดมินตอบแล้ว = ข้าม ไม่เสียโควตา AI)
+ */
+function awaitingReply(c) {
+  return Boolean(c.noReplyBuyerMessageTime)
+    || Number(c.latestSellerMessageSourceType) === 1
+    || Number(c.unReadCount) > 0;
+}
+
+let catchupRunning = false;
 async function catchUpUnread() {
+  if (catchupRunning) return;
+  catchupRunning = true;
+  try { await scanPendingRooms(); }
+  finally { catchupRunning = false; }
+}
+
+async function scanPendingRooms() {
   if (!CATCHUP) return;
+  const cutoff = Date.now() - CATCHUP_DAYS * 86400_000;
+
+  // ไล่หลายหน้า จนกว่าจะเจอห้องที่เก่ากว่าช่วงตามเก็บ (เดิมดูแค่หน้าแรกหน้าเดียว)
   let rooms = [];
+  let scanned = 0;
   try {
-    const res = await api.queryConversationList({
-      shopIdList: shops.map(s => s.id ?? s.shopId), size: 200, offset: 0,
-    });
-    rooms = (res?.list ?? []).filter(c => Number(c.unReadCount) > 0);
+    for (let page = 0; page < CATCHUP_PAGES; page++) {
+      const res = await api.queryConversationList({
+        shopIdList: shops.map(s => s.id ?? s.shopId), size: 100, offset: page * 100,
+      });
+      const list = res?.list ?? [];
+      scanned += list.length;
+      rooms.push(...list);
+      const oldest = Math.min(...list.map(c => c.lastMessageTimestamp ?? Infinity));
+      if (!res?.hasMore || list.length < 100 || oldest < cutoff) break;
+    }
   } catch (err) {
     if (isAuthError(err)) relogin();
     out({ event: 'warn', what: 'ดึงห้องค้าง', error: err.message });
     return;
   }
 
-  // เอาเฉพาะที่ยังใหม่พอ — ห้องค้างข้ามเดือนไม่ควรเด้งไปตอบตอนนี้
-  const cutoff = Date.now() - CATCHUP_DAYS * 86400_000;
-  const todo = rooms
-    .filter(c => !c.lastMessageTimestamp || c.lastMessageTimestamp >= cutoff)
+  // เอาเฉพาะที่ยังใหม่พอ และยังรอคำตอบอยู่
+  const fresh = rooms.filter(c => (!c.lastMessageTimestamp || c.lastMessageTimestamp >= cutoff) && awaitingReply(c));
+
+  // ข้ามห้องที่จัดการไปแล้วและยังไม่มีข้อความใหม่เข้ามาหลังจากนั้น
+  // กรองตรงนี้ก่อนดึงข้อความ จะได้ไม่เสีย API เปล่าทุก 15 นาที
+  // (ห้องที่บอททำเป็น "ยังไม่อ่าน" ไว้ให้เจ้าหน้าที่ จะค้างเป็นยังไม่อ่านจนกว่าคนจะเปิดอ่าน
+  //  ถ้าไม่กรองตรงนี้ มันจะถูกหยิบมาวนซ้ำทุกรอบไม่รู้จบ)
+  let skipped = 0;
+  const todo = fresh
+    .filter(c => {
+      const done = handledAt.get(c.conversationId);
+      if (done && done >= (c.lastMessageTimestamp ?? 0)) { skipped++; return false; }
+      return true;
+    })
     .sort((a, b) => (b.lastMessageTimestamp ?? 0) - (a.lastMessageTimestamp ?? 0))
     .slice(0, CATCHUP_LIMIT);
 
   if (!todo.length) return;
-  out({ event: 'catchup_start', rooms: todo.length, unreadTotal: rooms.length });
+  out({
+    event: 'catchup_start', rooms: todo.length, scanned,
+    awaiting: fresh.length, skippedHandled: skipped || undefined,
+  });
 
   for (const c of todo) {
     const e = { shopId: c.shopId, conversationId: c.conversationId, platform: c.platform };
-    try {
-      const info = await getConvInfo(e);
-      // เข้าคิวแทนการเรียก AI ตรง ๆ — คิวจะทยอยทำทีละห้อง ไม่ยิงรวดเดียวจนโดนจำกัดโควตา
-      enqueueRoom(e, { ...info, buyerNick: c.buyerNick ?? info.buyerNick },
-        { event: 'catchup_room', unread: c.unReadCount });
-    } catch (err) {
-      if (isAuthError(err)) { relogin(); return; }
-      out({ event: 'warn', what: 'ตามเก็บห้อง', error: err.message });
-    }
+    // ใช้ข้อมูลห้องจากรายการได้เลย ไม่ต้องยิง viewConversation ทีละห้อง
+    // (แถมรายการมี buyerNick/groupId/tagIdList ครบกว่า viewConversation ที่คืนไม่ครบ)
+    convCache.set(c.conversationId, { ...(convCache.get(c.conversationId) ?? {}), ...c });
+    enqueueRoom(e, c, { event: 'catchup_room', reason: c.noReplyBuyerMessageTime ? 'ลูกค้ารอคำตอบ' : 'บอทแพลตฟอร์มตอบล่าสุด' });
   }
 }
 
 /** ส่งการ์ดสินค้าตามหลังข้อความ (AI สั่งมาด้วย [[SEND_ITEM:...]] — รหัสผ่านการตรวจแล้ว) */
 async function sendProductCard(e, itemId) {
   if (!itemId) return;
+  if (await skipWaitingStaff(e)) return;
 
   // ห้องเดิม การ์ดใบเดิม ไม่ส่งซ้ำภายในเวลาที่กำหนด (ลูกค้าเห็นไปแล้ว ส่งซ้ำรก)
   const room = sentCards.get(e.conversationId) ?? new Map();
@@ -647,25 +818,71 @@ async function sendProductCard(e, itemId) {
 // จะ "log ร่างคำตอบก่อนเสมอ" แล้วค่อยให้ตัวเรียกจัดการแท็ก
 // คืนสถานะ: 'sent' | 'suggested' | 'staff' | 'skipped' | 'declined' | 'disabled' | 'error'
 //   'skipped' = ไม่ต้องตอบ (ร้านตอบไปแล้ว / ลูกค้าพิมพ์แค่คำรับ) → ตัวเรียกจะไม่แตะแท็กเลย
+function humanAfterBuyer(messages) {
+  for (let i = messages.length - 1; i >= 0; i--) {
+    if (Number(messages[i].fromAccountType) === 1) return null;
+    if (ai.shopSenderKind(messages[i], myUid) === 'staff') return messages[i];
+  }
+  return null;
+}
+
+function buyerVersion(messages) {
+  const buyer = [...messages].reverse().find(m => Number(m.fromAccountType) === 1);
+  return buyer ? String(buyer.messageId ?? buyer.id ?? JSON.stringify(buyer)) : null;
+}
+
 async function aiRespond(e, info) {
   if (!ai.isEnabled()) return 'disabled';
   try {
+    if (await skipWaitingStaff(e, info)) return 'stale';
     // ดึงประวัติล่าสุดเป็นบริบท (เก่า → ใหม่)
     const hist = await api.getMessageList({ ...e, pageNo: 1, pageSize: 30 });
     const messages = (hist?.list ?? []).slice().reverse();
+    const question = [...messages].reverse().find(m => Number(m.fromAccountType) === 1);
+    e = { ...e, replyTo: question ? {
+      messageId: question.messageId ?? question.id,
+      type: question.messageType,
+      text: stripAnsi(describe(question)),
+    } : undefined };
+    const human = humanAfterBuyer(messages);
+    if (human || !buyerVersion(messages)) {
+      outRoom(e, info, { event: 'ai_skip', reason: human ? 'human_already_replied' : 'no_customer_message', sender: human?.account });
+      return 'skipped';
+    }
+    const stillCurrent = async () => {
+      if (await skipWaitingStaff(e, info)) return false;
+      const latest = await api.getMessageList({ ...e, pageNo: 1, pageSize: 30 });
+      const current = (latest?.list ?? []).slice().reverse();
+      if (!current.length) throw new Error('Cannot verify current conversation before sending');
+      const staff = humanAfterBuyer(current);
+      if (staff) {
+        outRoom(e, info, { event: 'ai_skip', reason: 'human_replied_while_drafting', sender: staff.account });
+        return false;
+      }
+      if (buyerVersion(current) !== buyerVersion(messages)) {
+        pendingLive.set(e.conversationId, { e, info, note: { event: 'redraft', reason: 'new_customer_message' } });
+        outRoom(e, info, { event: 'ai_skip', reason: 'draft_outdated' });
+        return false;
+      }
+      return true;
+    };
 
     // กันตอบซ้ำ: ทั้ง "ตามเก็บห้องค้าง" และ "แชทเด้ง" อาจเข้าห้องเดียวกันห่างกันไม่กี่วินาที
     // ถ้าข้อความล่าสุดของลูกค้ายังเป็นตัวเดิมที่ตอบไปแล้ว = ไม่มีอะไรใหม่ ไม่ต้องตอบอีก
-    const lastBuyerMsg = [...messages].reverse().find(m => m.fromAccountType === 1);
+    const lastBuyerMsg = [...messages].reverse().find(m => Number(m.fromAccountType) === 1);
     const lastId = lastBuyerMsg?.messageId ?? lastBuyerMsg?.id;
-    if (lastId && answeredMsgId.get(e.conversationId) === lastId) {
+    if (lastId && String(answeredMsgId.get(e.conversationId)) === String(lastId)) {
       outRoom(e, info, { event: 'ai_skip', reason: 'ตอบข้อความนี้ไปแล้ว' });
       return 'skipped';
     }
-    if (lastId) {
+    const rememberSent = () => { if (lastId) {
       answeredMsgId.set(e.conversationId, lastId);
-      if (answeredMsgId.size > 2000) answeredMsgId.clear();
-    }
+      answeredDirty = true;
+      // อย่าล้างทั้งก้อน (เดิมใช้ clear() ทำให้ห้องที่ตอบแล้วโดนตอบซ้ำ) — ตัดเฉพาะตัวเก่าสุด
+      if (answeredMsgId.size > 2000) {
+        for (const k of [...answeredMsgId.keys()].slice(0, 500)) answeredMsgId.delete(k);
+      }
+    } };
 
     // เคสใบกำกับภาษี — ติดแท็กตามยอดสั่งซื้อ ทำก่อนเรียก AI เพราะเป็นกฎตายตัว
     // ไม่เกี่ยวกับว่า AI จะตอบว่าอะไร และต้องทำงานในโหมดคิวไฟล์ด้วย
@@ -703,7 +920,7 @@ async function aiRespond(e, info) {
     const u = ai.lastUsage?.();
     if (u) {
 
-      outRoom(e, info, { event: 'usage', in: u.in, cacheWrite: u.cacheWrite, cacheRead: u.cacheRead, out: u.out, webSearches: u.searches || 0 });
+      outRoom(e, info, { event: 'usage', model: u.model, switched: u.switched, in: u.in, cacheWrite: u.cacheWrite, cacheRead: u.cacheRead, out: u.out, webSearches: u.searches || 0 });
     }
 
     // ร้านตอบคำถามนี้ครบไปแล้ว (หรือลูกค้าพิมพ์แค่คำรับ) → เงียบไว้ทั้งข้อความและแท็ก
@@ -714,6 +931,7 @@ async function aiRespond(e, info) {
     }
 
     // ไม่มีร่างคำตอบเลย → อย่างน้อยต้องตอบเบื้องต้นให้ลูกค้า แล้วให้เจ้าหน้าที่ตามต่อ
+    if (!await stillCurrent()) return 'stale';
     if (!r.reply) {
       outRoom(e, info, { event: 'ai_reply', status: 'no_draft', reason: r.reason ?? 'ไม่มีคำตอบ' });
       await sendHolding(e);
@@ -737,6 +955,7 @@ async function aiRespond(e, info) {
         shopId: e.shopId, conversationId: e.conversationId, platform: e.platform,
         text: r.reply, puid: myPuid,
       });
+      rememberSent();
       outRoom(e, info, { event: 'ai_reply', status: 'sent_staff', reason: r.reason, text: oneLine(r.reply) });
       return 'staff';
     }
@@ -747,6 +966,7 @@ async function aiRespond(e, info) {
         shopId: e.shopId, conversationId: e.conversationId, platform: e.platform,
         text: r.reply, puid: myPuid,
       });
+      rememberSent();
       outRoom(e, info, { event: 'ai_reply', status: 'sent', text: oneLine(r.reply), swapped: r.swapped?.length ? r.swapped : undefined });
       await sendProductCard(e, r.sendItemId);
       return 'sent';
@@ -759,7 +979,7 @@ async function aiRespond(e, info) {
     // โควตาหมด/ถูกจำกัดอัตรา → โยนต่อให้คิวจัดการ (ถอยรอแล้วลองใหม่)
     // ห้ามส่งข้อความเบื้องต้นตรงนี้ ไม่งั้นลูกค้าจะได้ข้อความซ้ำตอนลองใหม่สำเร็จ
     if (isRateLimit(err)) throw err;
-    out({ event: 'error', what: 'AI ร่างคำตอบ', error: shortError(err) });
+    outRoom(e, info, { event: 'error', what: 'AI ร่างคำตอบ', error: shortError(err) });
     await sendHolding(e);            // AI ล่ม ลูกค้าก็ยังต้องได้คำตอบเบื้องต้น
     return 'error';
   }
@@ -778,6 +998,7 @@ function wireEvents() {
       const list = (msgs?.list ?? []).slice().reverse();      // เก่า → ใหม่
 
       let sawBuyerMsg = false;
+      let sawHumanReply = false;
       for (const m of list) {
         if (seenMessageIds.has(m.messageId)) continue;
         seenMessageIds.add(m.messageId);
@@ -785,12 +1006,14 @@ function wireEvents() {
 
         const fromBuyer = m.fromAccountType === 1;
         if (fromBuyer) sawBuyerMsg = true;
+        if (!fromBuyer && ai.shopSenderKind(m, myUid) === 'staff') sawHumanReply = true;
         if (ONLY_BUYER && !fromBuyer) continue;
 
 
 
         outRoom(e, info, {
           event: 'message',
+          messageId: m.messageId ?? m.id,
           from: fromBuyer ? 'customer' : ai.shopSenderKind(m, myUid),   // shop: platform-bot | me | staff
           sender: m.account ?? undefined,
           type: m.messageType,
@@ -816,7 +1039,15 @@ function wireEvents() {
       // มีข้อความจากลูกค้า → ให้ AI ตอบ/แนะนำก่อน (log ออกทันที) แล้วค่อยจัดการแท็ก
       // เข้าคิวเหมือนกับตอนตามเก็บ เพื่อไม่ให้แชทเด้งหลายห้องพร้อมกันยิง AI ซ้อนกัน
       // (การติดแท็กย้ายไปทำในคิวแล้ว ดู runQueue)
-      if (sawBuyerMsg) enqueueRoom(e, info);
+      if (sawBuyerMsg) enqueueRoom(e, info, null, true);   // true = ลูกค้าทักสด ๆ ให้แซงคิว
+      if (sawHumanReply && process.env.AI_LEARN_ADMIN !== 'false') {
+        // Learning does not occupy an AI worker or delay enqueueing a live customer.
+        api.getMessageList({ ...e, pageNo: 1, pageSize: 30 }).then(hist => {
+          const added = collectAdminExamples((hist?.list ?? []).slice().reverse(),
+            m => ai.shopSenderKind(m, myUid) === 'staff', { buyerName: info.buyerNick });
+          if (added) outRoom(e, info, { event: 'admin_example_saved', added });
+        }).catch(err => outRoom(e, info, { event: 'warn', what: 'learn_admin', error: shortError(err) }));
+      }
     } catch (err) {
       if (isAuthError(err)) return relogin();
       out({ event: 'error', what: 'ดึงข้อความ', error: err.message });

@@ -31,6 +31,7 @@ import { fileURLToPath } from 'node:url';
 import Anthropic from '@anthropic-ai/sdk';
 import OpenAI from 'openai';
 import { parseMessageContent } from './duoke-api.js';
+import { relevantAdminExamples } from './admin-examples.js';
 
 const __dirname = path.dirname(fileURLToPath(import.meta.url));
 
@@ -40,6 +41,22 @@ const __dirname = path.dirname(fileURLToPath(import.meta.url));
 //               แล้วติดแท็ก "รอเจ้าหน้าที่" ให้คนตามไปตอบต่อ (ลูกค้าไม่ถูกปล่อยเงียบ)
 //   [[SKIP]]  = ร้านตอบคำถามนั้นครบไปแล้ว ไม่ต้องตอบซ้ำ
 const MARK_RE = /\[\[\s*(AUTO|STAFF|SKIP)\s*\]\]/i;
+
+// บางโมเดล (เจอกับ gemini-3.1-flash-lite) ไม่เขียน [[STAFF]] ตามรูปแบบ แต่เขียนคำว่า "ธง" ออกมาตรง ๆ
+// เช่น "ธง STAFF สวัสดีครับ…" หรือ "ธงครับ ทางร้านเปิด…" ซึ่งจะหลุดไปถึงลูกค้า
+// ตัดเฉพาะตอนอยู่ต้นข้อความ และต้องตามด้วยชื่อธงหรือคำลงท้าย เพื่อไม่ให้ไปโดนคำว่า "ธง" ที่เป็นสินค้าจริง
+const FLAG_LEAK_RE = /^[\s"'`]*ธง\s*(?:(?:AUTO|STAFF|SKIP)\b|ครับผม|ครับ|ค่ะ|คะ)[\s:：\-—,.]*/i;
+// บางทีหลุดมาแค่ "ธ" หรือ "ธง" อยู่บรรทัดแรกเดี่ยว ๆ แล้วขึ้นบรรทัดใหม่
+const FLAG_STUB_RE = /^[\s"'`]*ธง?[ \t:：\-—,.]*\r?\n/;
+
+/** ตัดคำว่า "ธง…" ที่โมเดลเขียนติดมาต้นคำตอบ */
+function stripFlagLeak(text) {
+  let t = String(text ?? '');
+  for (let i = 0; i < 3 && (FLAG_LEAK_RE.test(t) || FLAG_STUB_RE.test(t)); i++) {
+    t = t.replace(FLAG_LEAK_RE, '').replace(FLAG_STUB_RE, '');
+  }
+  return t;
+}
 
 // AI สั่งให้ส่ง "การ์ดสินค้า" ตามหลังข้อความได้ ด้วย [[SEND_ITEM:<รหัสสินค้า>]]
 // รหัสต้องมีอยู่จริงในคลังสินค้าเท่านั้น ไม่งั้นทิ้ง (กัน AI แต่งรหัสขึ้นมาเอง)
@@ -106,10 +123,42 @@ function resolveModel() {
   return want;
 }
 let _model = null;
-/** โมเดลที่ใช้จริง (คิดครั้งเดียวแล้วจำไว้) */
-function modelName() {
+/** โมเดลหลักที่ตั้งไว้ (คิดครั้งเดียวแล้วจำไว้) */
+function primaryModel() {
   if (_model === null) _model = resolveModel();
   return _model;
+}
+
+// ---- สลับโมเดลสำรองอัตโนมัติเมื่อโควตารายวันเต็ม ----
+// ฟรีเทียร์ของ Gemini จำกัดเป็น "ครั้งต่อวันต่อโมเดล" (เช่น flash-lite 500/วัน · flash 20/วัน)
+// พอเต็มแล้วรอเท่าไหร่ก็ไม่ได้ ต้องข้ามไปใช้โมเดลอื่นที่ยังมีโควตาเหลือ
+// ⚠ ชื่อย่อ (เช่น gemini-flash-lite-latest) ใช้โควตาก้อนเดียวกับรุ่นที่มันชี้ไป อย่าใส่เป็นตัวสำรอง
+const _exhausted = new Map();                 // ชื่อโมเดล → เวลาที่จะกลับมาลองใหม่ (ms)
+const EXHAUSTED_RETRY_MS = Number(process.env.AI_MODEL_COOLDOWN_MIN || 60) * 60_000;
+
+/** โมเดลหลัก + ตัวสำรองจาก AI_MODEL_FALLBACK (คั่นด้วยคอมมา) */
+function modelCandidates() {
+  const fallbacks = (process.env.AI_MODEL_FALLBACK || '')
+    .split(',').map(s => s.trim()).filter(Boolean);
+  return [...new Set([primaryModel(), ...fallbacks])];
+}
+
+/** โมเดลที่จะใช้ตอนนี้ — ข้ามตัวที่โควตาเต็มไปแล้ว */
+function modelName() {
+  const now = Date.now();
+  const all = modelCandidates();
+  return all.find(m => !(_exhausted.get(m) > now)) ?? all[0];
+}
+
+/** จดว่าโมเดลนี้โควตารายวันเต็ม ให้พักไว้ก่อนแล้วค่อยลองใหม่ */
+function markExhausted(model) {
+  _exhausted.set(model, Date.now() + EXHAUSTED_RETRY_MS);
+}
+
+/** 429 นี้เป็นลิมิตรายวันไหม (ถ้าใช่ = รอไปก็ไม่ได้ ต้องเปลี่ยนโมเดล) */
+function isDailyQuota(err) {
+  const m = String(err?.message ?? '');
+  return err?.status === 429 && /PerDay|per day|_free_tier_requests/i.test(m);
 }
 
 // ต้องเห็นบริบทย้อนหลังพอ ไม่งั้นข้อความสั้น ๆ อย่าง "5*8" หรือ "เอาอันนี้" จะตีความไม่ออก
@@ -392,22 +441,38 @@ async function callLLM({ systemBlocks, messages, maxTokens }) {
           : { type: 'text', text: b.text }))
         : m.content,
     }));
-    const res = await getOpenAICompatible().chat.completions.create({
-      model: modelName(),
-      max_tokens: maxTokens,
-      messages: [{ role: 'system', content: systemText }, ...msgs],
-    });
-    // ทางนี้ไม่แยกโทเคนที่แคชไว้ให้ดู มีแต่ยอดรวม → ใส่ใน in/out ตรง ๆ
-    const u = res.usage ?? {};
-    _lastUsage = {
-      in: u.prompt_tokens ?? 0,
-      cacheWrite: 0,
-      cacheRead: u.prompt_tokens_details?.cached_tokens ?? 0,
-      out: u.completion_tokens ?? 0,
-      searches: 0,
-    };
-    _lastSources = '';
-    return (res.choices?.[0]?.message?.content ?? '').trim();
+    // วนลองโมเดลหลัก → ตัวสำรอง ถ้าตัวไหนโควตารายวันเต็มก็ข้ามไปตัวถัดไป
+    const tried = [];
+    let lastErr = null;
+    for (const model of modelCandidates()) {
+      if (_exhausted.get(model) > Date.now()) continue;     // รู้อยู่แล้วว่าเต็ม ข้ามเลย
+      tried.push(model);
+      try {
+        const res = await getOpenAICompatible().chat.completions.create({
+          model,
+          max_tokens: maxTokens,
+          messages: [{ role: 'system', content: systemText }, ...msgs],
+        });
+        // ทางนี้ไม่แยกโทเคนที่แคชไว้ให้ดู มีแต่ยอดรวม → ใส่ใน in/out ตรง ๆ
+        const u = res.usage ?? {};
+        _lastUsage = {
+          in: u.prompt_tokens ?? 0,
+          cacheWrite: 0,
+          cacheRead: u.prompt_tokens_details?.cached_tokens ?? 0,
+          out: u.completion_tokens ?? 0,
+          searches: 0,
+          model,
+          switched: tried.length > 1 ? `${tried[0]}→${model}` : undefined,
+        };
+        _lastSources = '';
+        return (res.choices?.[0]?.message?.content ?? '').trim();
+      } catch (err) {
+        lastErr = err;
+        if (!isDailyQuota(err)) throw err;                  // ไม่ใช่โควตารายวัน → โยนให้คิวจัดการ
+        markExhausted(model);                               // เต็มรายวัน → พักตัวนี้ไว้ ลองตัวถัดไป
+      }
+    }
+    throw lastErr ?? new Error('ไม่มีโมเดลที่ใช้ได้ (โควตารายวันเต็มทุกตัวใน AI_MODEL + AI_MODEL_FALLBACK)');
   }
   // Anthropic (Claude): system เป็น array บล็อก (มี cache_control สำหรับ prompt caching)
   const client = getAnthropic();
@@ -583,6 +648,18 @@ export function buildSystemPrompt({ shopName, platform, buyerName }) {
   stable += kb
     ? '\n\n===== ข้อมูลร้าน/สินค้า (ใช้ตอบลูกค้า) =====\n' + kb
     : '\n\n(ยังไม่มีข้อมูลสินค้าในโฟลเดอร์ knowledge/ — คำถามที่ต้องใช้ข้อมูลเฉพาะให้ใส่ธง [[STAFF]])';
+
+  stable += '\n\nกติกาความถูกต้องและการตอบต่อเนื่อง (ใช้เมื่อคำแนะนำข้างต้นขัดกัน):\n' + [
+    'ตอบประเด็นล่าสุดของลูกค้าก่อน ใช้แชทก่อนหน้าเพื่อเข้าใจสินค้าและคำอ้างอิง ไม่ย้อนตอบทุกคำถามเก่า',
+    'คำตอบเก่าของบอทและตัวอย่างแอดมินใช้ดูสำนวนเท่านั้น ไม่ใช่หลักฐานว่าสินค้า สต็อก หรือสถานะออร์เดอร์เป็นจริง',
+    'ยืนยันข้อมูลเฉพาะจากข้อมูลสินค้าหรือออร์เดอร์ที่ตรงรายการเท่านั้น ห้ามเอาสเปกสินค้าชื่อคล้ายกันมาตอบแทน',
+    'ข้อมูลทั่วไปอธิบายได้ แต่ห้ามเดาวัสดุ ขนาด จำนวนต่อแพ็ค น้ำหนักรับได้ สต็อก หรือสัญญาวันส่งของ หากไม่มีหลักฐาน',
+    'หากระบุสินค้าไม่ได้ ให้ถามขอขนาด รุ่น หรือการ์ดสินค้าเพียงคำถามเดียว ไม่ต้องส่งต่อเจ้าหน้าที่สำหรับคำถามทั่วไป',
+    'อย่าอ้างว่าค้น Google ติดต่อขนส่ง หรือดำเนินการแล้ว หากไม่มีผลการทำงานนั้นในบริบท',
+    'ลูกค้าถามซ้ำให้ตอบตรงประเด็นด้วยถ้อยคำที่สั้นและชัดขึ้น ไม่คัดลอกย่อหน้าเดิม ไม่เปลี่ยนข้อเท็จจริงเพื่อให้คำตอบต่าง',
+    'ถ้าบอทตอบไปแล้ว ตอบเสริมเฉพาะส่วนที่ยังขาด ถ้าครบแล้วและไม่มีคำถามใหม่ให้ [[SKIP]] ห้ามสร้างคำถามหรือข้อมูลเพิ่มเอง',
+    'เคสใบกำกับ บิลเงินสด และปัญหาส่งสินค้าผิดใช้ [[STAFF]] ตามกฎร้าน ห้ามยืนยันว่าได้ดำเนินการแทนเจ้าหน้าที่แล้ว',
+  ].join('\n');
 
   // ---- บล็อกแปรผัน (ไม่แคช) ----
   const volatile = `บริบทห้องแชทนี้ — ร้าน: "${shopName ?? 'ร้านค้า'}" · แพลตฟอร์ม: ${platform ?? '-'} · ลูกค้า: "${buyerName ?? 'ลูกค้า'}"`;
@@ -814,6 +891,10 @@ function oneLineShort(t, max = 40) {
   return String(t ?? '').replace(/s+/g, ' ').trim().slice(0, max);
 }
 
+// ชื่อบัญชีที่เป็นบอทเราเอง (ข้อความจากบัญชีนี้ไม่นับว่า "เจ้าหน้าที่ตอบแล้ว") คั่นด้วย ,
+const BOT_ACCOUNTS = new Set((process.env.AI_BOT_ACCOUNTS || 'ADMIN-TAK')
+  .split(',').map(x => x.trim().toLowerCase()).filter(Boolean));
+
 export function shopSenderKind(msg, myUid) {
   const src = Number(msg?.messageSource);
   const acc = msg?.account;
@@ -821,6 +902,7 @@ export function shopSenderKind(msg, myUid) {
   if (!acc && (src === 1 || src === 3)) return 'platform-bot';
   if (!acc) return 'platform-bot';
   if (myUid && String(msg?.uid) === String(myUid)) return 'me';
+  if (BOT_ACCOUNTS.has(String(acc).trim().toLowerCase())) return 'me';
   return 'staff';
 }
 
@@ -911,6 +993,8 @@ const MUST_STAFF_RE = new RegExp([
   'เคลม', 'คืนเงิน', 'คืนสินค้า', 'รีฟัน', 'refund',
   // ลูกค้าไม่พอใจ
   'ร้องเรียน', 'ไม่พอใจ', 'แย่มาก', 'โกง',
+  // เอกสาร — ต้องให้เจ้าหน้าที่ออกเอกสารจริงและกรอกข้อมูลบริษัทลูกค้า AI ทำแทนไม่ได้
+  'ใบกำกับ', 'ใบกํากับ', 'บิลเงินสด', 'ใบเสร็จ', 'ใบเสด', 'ใบหัก ณ ที่จ่าย', 'หัก ณ ที่จ่าย',
 ].join('|'), 'i');
 
 // ------------------------------------------------- แท็กใบกำกับภาษี / สลิปออนไลน์
@@ -993,7 +1077,7 @@ function isSmallTalk(text) {
  */
 function buildProductContext(rawMessages, dialogue) {
   const ids = [];
-  for (const m of rawMessages) {
+  for (const m of rawMessages.slice(-MAX_HISTORY)) {
     if (m.messageType !== 'item' && m.messageType !== 'product') continue;
     const id = parseMessageContent(m)?.itemId;
     if (id && !ids.includes(String(id))) ids.push(String(id));
@@ -1003,7 +1087,8 @@ function buildProductContext(rawMessages, dialogue) {
 
   // ไฟล์หัวข้อ (ตารางจำนวนบรรจุ ฯลฯ) — ดูจากทุกข้อความของลูกค้าในห้อง ไม่ใช่แค่ข้อความล่าสุด
   // เพราะลูกค้ามักถามชื่อสินค้าก่อน แล้วค่อยถามต่อว่า "ขนาด 6x11 กี่ใบ"
-  const askText = dialogue.filter(d => d.role === 'user').map(d => contentText(d.content)).join(' ');
+  const buyerMessages = rawMessages.filter(m => Number(m.fromAccountType) === 1);
+  const askText = buyerMessages.slice(-6).map(renderForAI).join(' ');
   const topic = matchTopics(askText);
   if (topic) parts.push(topic);
 
@@ -1016,7 +1101,7 @@ function buildProductContext(rawMessages, dialogue) {
   }
 
   // ไม่มีการ์ด (หรือการ์ดไม่มีไฟล์) → ค้นจากข้อความล่าสุดของลูกค้า
-  const lastAsk = contentText(dialogue[dialogue.length - 1]?.content ?? '');
+  const lastAsk = buyerMessages.length ? renderForAI(buyerMessages.at(-1)) || '' : '';
   const joined = () => parts.join('\n\n');
   if (/^\[/.test(lastAsk)) return joined();      // เป็นบันทึกบริบท ไม่ใช่คำถามลูกค้า
   // เคสร้องเรียน/ปัญหาออร์เดอร์ ไม่ได้ถามหาสินค้า — ค้นไปก็ได้ของไม่เกี่ยว
@@ -1027,7 +1112,7 @@ function buildProductContext(rawMessages, dialogue) {
   if (!hits.length) return joined();
 
   const detail = loadProductDetail(hits[0].id);
-  if (detail) parts.push(detail);
+  if (detail) parts.push('ผลค้นหาชื่อใกล้เคียง ยังไม่ยืนยันว่าเป็นสินค้าที่ลูกค้าหมายถึง ห้ามนำสเปกไปยืนยันจนกว่าจะตรงรุ่น:\n' + detail);
   if (hits.length > 1) {
     parts.push('รายการอื่นในร้านที่ชื่อใกล้เคียง (ยังไม่มีรายละเอียด ถ้าลูกค้าสนใจตัวไหนให้ถามกลับ):\n'
       + hits.slice(1).map(h => `- ${h.name}${h.opts ? ` · ตัวเลือก: ${h.opts}` : ''}`).join('\n'));
@@ -1057,16 +1142,18 @@ export async function generateReply({ messages, shopName, platform, buyerName, o
   const rawMsgs = messages || [];
   const rawTrailing = [];
   for (let i = rawMsgs.length - 1; i >= 0; i--) {
-    if (rawMsgs[i].fromAccountType === 1) break;
+    if (Number(rawMsgs[i].fromAccountType) === 1) break;
     rawTrailing.unshift(rawMsgs[i]);
   }
+  // ข้ามเฉพาะเมื่อ "เจ้าหน้าที่ตัวจริง" (เช่น Admin-riw) ตอบไปแล้ว
+  // ข้อความของบอทแพลตฟอร์ม และของบอทเราเอง (ADMIN-TAK) → ยังตอบ โดยส่งข้อความเดิมเป็นบริบทให้ AI ไม่พูดซ้ำ
+  // (กันวนตอบข้อความลูกค้าตัวเดิมซ้ำ ทำใน watch.js ด้วย answeredMsgId ที่เก็บลงไฟล์)
   const byHuman = rawTrailing.find(m => {
-    const kind = shopSenderKind(m, myUid);
-    if (kind === 'platform-bot') return false;          // บอทแพลตฟอร์ม → ยังต้องตอบ
-    return (renderForAI(m) || '').length >= 5;          // คนหรือบอทเราตอบไปแล้ว → ห้ามตอบซ้ำ
+    if (shopSenderKind(m, myUid) !== 'staff') return false;
+    return true;
   });
   if (byHuman) {
-    const who = shopSenderKind(byHuman, myUid) === 'me' ? 'บอทตอบไปแล้ว' : `${byHuman.account} ตอบไปแล้ว`;
+    const who = `${byHuman.account || 'เจ้าหน้าที่'} ตอบไปแล้ว`;
     _lastUsage = { in: 0, cacheWrite: 0, cacheRead: 0, out: 0, searches: 0 };   // ไม่ได้เรียก AI
     return { needsStaff: false, skip: true, reason: `${who}: ${oneLineShort(renderForAI(byHuman))}` };
   }
@@ -1082,7 +1169,13 @@ export async function generateReply({ messages, shopName, platform, buyerName, o
   }
 
   if (trailingShop.length) {
-    dialogue.push({ role: 'user', content: `[ทางร้านตอบไปแล้วว่า: ${trailingShop.join(' / ')}]` });
+    const botAnswered = rawTrailing.some(m => shopSenderKind(m, myUid) === 'me');
+    dialogue.push({
+      role: 'user',
+      content: `[ทางร้านตอบไปแล้วว่า: ${trailingShop.join(' / ')}]` + (botAnswered
+        ? '\n[ห้ามพูดซ้ำกับที่ร้านตอบไปแล้ว ให้ตอบเฉพาะส่วนที่ยังไม่ได้ตอบ หรืออธิบายเพิ่มให้ชัดขึ้น]'
+        : ''),
+    });
   }
 
   // ออร์เดอร์จริงของลูกค้าคนนี้ (watch.js ดึงจาก Duoke มาให้ตอนลูกค้าถามเรื่องออร์เดอร์)
@@ -1118,6 +1211,15 @@ export async function generateReply({ messages, shopName, platform, buyerName, o
   }
 
   const systemBlocks = buildSystemPrompt({ shopName, platform, buyerName });
+  if (process.env.AI_LEARN_ADMIN !== 'false') {
+    try {
+      const latestBuyer = [...(messages || [])].reverse().find(m => Number(m.fromAccountType) === 1);
+      const examples = relevantAdminExamples(latestBuyer ? renderForAI(latestBuyer) : '');
+      if (examples) systemBlocks.push({ type: 'text', text: examples });
+    } catch {
+      // An unreadable example file must not prevent answering a customer.
+    }
+  }
   let text;
   try {
     text = await callLLM({ systemBlocks, messages: dialogue, maxTokens: MAX_TOKENS });
@@ -1146,7 +1248,7 @@ export async function generateReply({ messages, shopName, platform, buyerName, o
     if (loadProductDetail(id) || loadCatalog().some(r => r.id === id)) sendItemId = id;
   }
 
-  const drafted = text.replace(MARK_RE, '').replace(SEND_ITEM_RE, '').trim();
+  const drafted = stripFlagLeak(text.replace(MARK_RE, '').replace(SEND_ITEM_RE, '')).trim();
   if (!drafted) return askBack('AI ไม่ได้ร่างคำตอบ');
 
   // เปลี่ยนคำที่แพลตฟอร์มบล็อก (เช่น "ยกเลิก" บน Shopee) ก่อนใช้ต่อทุกทาง
