@@ -1,6 +1,23 @@
 {
-  "watch": ["watch.js", "duoke-api.js", "duoke-realtime.js", "duoke-auth.js", "duoke-session.js", ".env"],
+  "watch": [
+    "watch.js",
+    "duoke-api.js",
+    "duoke-realtime.js",
+    "duoke-auth.js",
+    "duoke-session.js",
+    ".env",
+    "db.js",
+    "db-log.js"
+  ],
   "ext": "js,json",
-  "ignore": ["node_modules", "*.log", ".token.json", "captcha.jpg"],
+  "ignore": [
+    "node_modules",
+    "*.log",
+    ".token.json",
+    "captcha.jpg",
+    "web",
+    ".token.lock",
+    "*.tmp"
+  ],
   "delay": "500"
 }

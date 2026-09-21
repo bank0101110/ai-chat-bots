@@ -10,3 +10,6 @@ inbox/
 .chrome-shopee/
 .handled.json
 .answered.json
+.token.lock
+.token.json.*.tmp
+web/dist/

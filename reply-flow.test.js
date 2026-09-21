@@ -23,6 +23,7 @@ function fixture(initial, latest = initial, failSend = false) {
     sendHolding: async () => false, oneLine: x => x, shortError: e => e.message, isAuthError: () => false, isRateLimit: () => false,
     stripAnsi: x => x, describe: m => JSON.parse(m.messageContent).text,
     skipWaitingStaff: async () => false,
+    aiBlockedByUi: async () => null,
   });
   vm.runInContext(handler, ctx);
   return { ctx, sent, logs, drafts: () => drafts, run: () => ctx.aiRespond({ conversationId: 'room' }, {}) };
@@ -102,4 +103,14 @@ test('queue reserves live capacity, promotes waiting rooms, and serializes a roo
   await new Promise(resolve => setImmediate(resolve));
   assert.equal(started.filter(id => id === 'new').length, 2);
   for (const release of releases) release();
+});
+
+test('UI pause / admin reply from Duoke Desk blocks the AI before drafting', async () => {
+  for (const reason of ['paused', 'staff_replied']) {
+    const f = fixture([buyer('1')]);
+    f.ctx.aiBlockedByUi = async () => reason;
+    assert.equal(await f.run(), 'skipped');
+    assert.equal(f.drafts(), 0);
+    assert.equal(f.sent.length, 0);
+  }
 });

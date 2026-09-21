@@ -32,7 +32,8 @@ import path from 'node:path';
 import { fileURLToPath } from 'node:url';
 import { DuokeApi, parseMessageContent } from './duoke-api.js';
 import { DuokeRealtime } from './duoke-realtime.js';
-import { getSession, clearCache } from './duoke-session.js';
+import { getSession, refreshSession, watchSharedSession } from './duoke-session.js';
+import { recordEvent, aiBlockedByUi } from './db-log.js';
 import * as ai from './ai-bot.js';
 import { writeInbox } from './inbox-store.js';
 import { collectAdminExamples } from './admin-examples.js';
@@ -121,6 +122,7 @@ function ts() {
 function out(obj) {
   const line = JSON.stringify({ time: ts(), ...obj }, null, obj.event === 'ai_reply' ? 2 : undefined);
   console.log(line);
+  recordEvent(obj);                 // บันทึกลง Supabase ให้ UI เปิดดูย้อนหลัง (ไม่ได้ตั้ง DATABASE_URL = ข้าม)
 }
 
 // viewConversation ไม่คืน buyerNick มาให้ (ชื่อลูกค้ามาจากลิสต์ห้องหรือ socket เท่านั้น)
@@ -135,6 +137,7 @@ function outRoom(e, info, obj) {
   out({
     shop: info?.shopName ?? shopNameOf(e?.shopId) ?? e?.shopId,
     platform: e?.platform,
+    shopId: e?.shopId,
     buyer: buyerNames.get(cid) ?? cid,
     conversationId: cid,
     replyTo: e?.replyTo,
@@ -339,9 +342,13 @@ let myUid = null;                   // uid ของบัญชี — ใช�
 
 // ---------------------------------------------------------------- ขั้นที่ 1: login
 
-async function authenticate({ force = false } = {}) {
-  const s = await getSession({ force, email: EMAIL, password: PASSWORD });
-  const how = { cache: 'ใช้ token ที่แคชไว้', env: 'ใช้ DUOKE_TOKEN จาก .env', login: 'ล็อกอินใหม่' }[s.source];
+async function authenticate({ staleToken } = {}) {
+  // staleToken = token ที่เพิ่งโดน 401 — ถ้าโปรเซสอื่น (เช่น ui-server) ล็อกอินไปแล้ว จะได้ token ตัวใหม่
+  // จาก .token.json ทันที ไม่ล็อกอินซ้ำ (ล็อกอินซ้ำ = token ของโปรเซสอื่นโดนเตะ)
+  const s = staleToken
+    ? await refreshSession(staleToken, { email: EMAIL, password: PASSWORD })
+    : await getSession({ email: EMAIL, password: PASSWORD });
+  const how = { cache: 'ใช้ token ที่แชร์ไว้', env: 'ใช้ DUOKE_TOKEN จาก .env', login: 'ล็อกอินใหม่', shared: 'ใช้ token ที่โปรเซสอื่นเพิ่งล็อกอิน' }[s.source];
   const left = s.expAt ? ` (เหลืออีก ~${Math.floor((s.expAt - Date.now()) / 86400000)} วัน)` : '';
   out({ event: 'login', how: stripAnsi(how).trim(), detail: stripAnsi(left).trim() || undefined });
   return s;
@@ -849,6 +856,13 @@ async function aiRespond(e, info) {
       outRoom(e, info, { event: 'ai_skip', reason: human ? 'human_already_replied' : 'no_customer_message', sender: human?.account });
       return 'skipped';
     }
+    // สั่งจาก UI: ปิด AI ห้องนี้ / แอดมินตอบผ่าน UI หลังข้อความล่าสุดของลูกค้าแล้ว
+    // (ข้อความที่ส่งจาก UI ใช้บัญชีเดียวกับบอท Duoke จึงมองว่าเป็น "me" ไม่ใช่ staff ต้องเช็คจาก DB)
+    const uiBlock = await aiBlockedByUi(e.conversationId, question?.createTime);
+    if (uiBlock) {
+      outRoom(e, info, { event: 'ai_skip', reason: uiBlock === 'paused' ? 'ปิด AI ห้องนี้จาก UI' : 'แอดมินตอบผ่าน UI แล้ว' });
+      return 'skipped';
+    }
     const stillCurrent = async () => {
       if (await skipWaitingStaff(e, info)) return false;
       const latest = await api.getMessageList({ ...e, pageNo: 1, pageSize: 30 });
@@ -857,6 +871,11 @@ async function aiRespond(e, info) {
       const staff = humanAfterBuyer(current);
       if (staff) {
         outRoom(e, info, { event: 'ai_skip', reason: 'human_replied_while_drafting', sender: staff.account });
+        return false;
+      }
+      const lastQ = [...current].reverse().find(m => Number(m.fromAccountType) === 1);
+      if (await aiBlockedByUi(e.conversationId, lastQ?.createTime)) {
+        outRoom(e, info, { event: 'ai_skip', reason: 'แอดมินตอบ/ปิด AI ผ่าน UI ระหว่างร่าง' });
         return false;
       }
       if (buyerVersion(current) !== buyerVersion(messages)) {
@@ -1085,9 +1104,9 @@ async function relogin() {
   reloggingIn = true;
   try {
     log(`${C.yellow}⚠️  token ใช้ไม่ได้แล้ว — กำลังล็อกอินใหม่${C.reset}`);
+    const stale = api?.token;
     rt?.disconnect();
-    clearCache();
-    const s = await authenticate({ force: true });
+    const s = await authenticate({ staleToken: stale });
     await connect(s.token);
     out({ event: 'relogin', state: 'ok' });
   } catch (err) {
@@ -1162,6 +1181,21 @@ if (CATCHUP && ai.isEnabled()) {
     setInterval(() => { catchUpUnread().catch(() => {}); }, CATCHUP_EVERY_MIN * 60_000).unref();
   }
 }
+
+// โปรเซสอื่น (ui-server.js / outbox.js) ล็อกอินได้ token ใหม่ → สลับมาใช้ตัวเดียวกัน ไม่ล็อกอินซ้ำ
+watchSharedSession(async s => {
+  if (stopping || reloggingIn || s.token === api?.token) return;
+  reloggingIn = true;
+  try {
+    out({ event: 'token_shared', note: 'ใช้ token ใหม่จาก .token.json (โปรเซสอื่นล็อกอิน)' });
+    rt?.disconnect();
+    await connect(s.token);
+  } catch (err) {
+    out({ event: 'warn', what: 'สลับ token', error: err.message });
+  } finally {
+    reloggingIn = false;
+  }
+});
 
 // ปิด socket ให้เรียบร้อยเวลา nodemon รีสตาร์ต (SIGUSR2) หรือกด Ctrl+C
 for (const sig of ['SIGINT', 'SIGTERM', 'SIGUSR2']) {

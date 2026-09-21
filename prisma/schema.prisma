@@ -1,0 +1,121 @@
+// Prisma schema — Supabase (PostgreSQL)
+//
+// .env:
+//   DATABASE_URL = connection pooler (port 6543) ต่อท้าย ?pgbouncer=true&connection_limit=1
+//   DIRECT_URL   = direct connection (port 5432) — ใช้ตอน prisma migrate / db push
+//
+// สร้างตาราง:  npm run db:push      (หรือ npm run db:migrate)
+// ดูข้อมูล:    npm run db:studio
+
+generator client {
+  provider = "prisma-client-js"
+}
+
+datasource db {
+  provider  = "postgresql"
+  url       = env("DATABASE_URL")
+  directUrl = env("DIRECT_URL")
+}
+
+/// ห้องแชทที่ระบบเคยเห็น (อัปเดตจากอีเวนต์ของบอท + ตอนเปิดใน UI)
+model Conversation {
+  id              String    @id                // conversationId ของ Duoke
+  shopId          String?
+  shopName        String?
+  platform        String?
+  buyerName       String?
+  buyerId         String?
+  lastMessageText String?
+  lastMessageAt   DateTime?
+  aiPaused        Boolean   @default(false)    // ปิด AI เฉพาะห้องนี้ (สั่งจาก UI)
+  lastStaffReplyAt DateTime?                   // แอดมินตอบผ่าน UI ล่าสุดเมื่อไหร่ (บอทจะไม่ตอบทับ)
+  note            String?                      // โน้ตลูกค้า
+  createdAt       DateTime  @default(now())
+  updatedAt       DateTime  @updatedAt
+
+  @@index([lastMessageAt])
+}
+
+/// ข้อความที่บอทเห็น (ลูกค้าทักเข้ามา) — ใช้ดูสถิติย้อนหลัง
+model Message {
+  id             String   @id                  // messageId ของ Duoke
+  conversationId String
+  fromKind       String                        // customer | me | staff | platform-bot
+  sender         String?
+  type           String?
+  text           String?
+  createdAt      DateTime @default(now())
+
+  @@index([conversationId, createdAt])
+}
+
+/// ทุกครั้งที่ AI ร่าง/ตอบ — เปิดดูย้อนหลังในหน้า "AI ตอบ"
+model AiReply {
+  id             String    @id @default(cuid())
+  conversationId String
+  shopId         String?
+  shopName       String?
+  platform       String?
+  buyerName      String?
+  questionId     String?
+  question       String?                       // ข้อความลูกค้าที่ AI ตอบ
+  reply          String?                       // คำตอบของ AI
+  status         String                        // sent | sent_staff | suggested | draft_staff | blocked | no_draft
+  reason         String?
+  model          String?
+  tokensIn       Int?
+  tokensOut      Int?
+  reviewed       Boolean   @default(false)     // แอดมินเปิดดูแล้ว
+  rating         String?                       // good | bad
+  reviewNote     String?
+  reviewedAt     DateTime?
+  createdAt      DateTime  @default(now())
+
+  @@index([createdAt])
+  @@index([conversationId, createdAt])
+  @@index([status])
+}
+
+/// ข้อความที่แอดมินส่งจาก UI
+model StaffReply {
+  id             String   @id @default(cuid())
+  conversationId String
+  shopId         String?
+  platform       String?
+  kind           String   @default("text")     // text | product
+  text           String?
+  itemId         String?
+  ok             Boolean  @default(true)
+  error          String?
+  aiReplyId      String?                       // ถ้าแก้จากร่างของ AI
+  createdAt      DateTime @default(now())
+
+  @@index([conversationId, createdAt])
+}
+
+/// คำตอบสำเร็จรูป (พิมพ์ / ในช่องตอบเพื่อเรียกใช้)
+model QuickReply {
+  id        String   @id @default(cuid())
+  title     String
+  text      String
+  shortcut  String?
+  sortOrder Int      @default(0)
+  useCount  Int      @default(0)
+  createdAt DateTime @default(now())
+  updatedAt DateTime @updatedAt
+}
+
+/// log อีเวนต์ทั้งหมดของ watch.js (event, payload)
+model EventLog {
+  id             BigInt   @id @default(autoincrement())
+  event          String
+  conversationId String?
+  shopName       String?
+  buyer          String?
+  payload        Json
+  createdAt      DateTime @default(now())
+
+  @@index([createdAt])
+  @@index([event, createdAt])
+  @@index([conversationId])
+}

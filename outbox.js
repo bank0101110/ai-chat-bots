@@ -19,7 +19,7 @@ import path from 'node:path';
 import { fileURLToPath } from 'node:url';
 import { DuokeApi } from './duoke-api.js';
 import { DuokeRealtime } from './duoke-realtime.js';
-import { getSession, clearCache } from './duoke-session.js';
+import { getSession, refreshSession } from './duoke-session.js';
 import { readInbox, removeInbox } from './inbox-store.js';
 
 const __dirname = path.dirname(fileURLToPath(import.meta.url));
@@ -78,8 +78,9 @@ let convIndex = new Map();       // conversationId -> { shopId, platform, buyerN
 let stopping = false;
 
 async function authenticate({ force = false } = {}) {
-  if (force) clearCache();
-  const s = await getSession({ force, email: process.env.DUOKE_EMAIL, password: process.env.DUOKE_PASSWORD });
+  // ใช้ token ชุดเดียวกับ watch.js / ui-server.js (.token.json) — โดน 401 ค่อยขอ token ใหม่แบบแชร์
+  const creds = { email: process.env.DUOKE_EMAIL, password: process.env.DUOKE_PASSWORD };
+  const s = force && api ? await refreshSession(api.token, creds) : await getSession(creds);
   api = new DuokeApi({ token: s.token, language: 'th' });
   const user = await api.getUser();
   puid = (user.user ?? user).puid ?? user.puid ?? s.puid;

@@ -35,12 +35,20 @@ function readCache() {
 }
 
 function writeCache(data) {
-  fs.writeFileSync(CACHE_FILE, JSON.stringify(data, null, 2));
-  try { fs.chmodSync(CACHE_FILE, 0o600); } catch {}
+  // เขียนไฟล์ชั่วคราวแล้ว rename — โปรเซสอื่นที่อ่านอยู่จะไม่เจอไฟล์ครึ่ง ๆ กลาง ๆ
+  const tmp = `${CACHE_FILE}.${process.pid}.tmp`;
+  fs.writeFileSync(tmp, JSON.stringify(data, null, 2));
+  try { fs.chmodSync(tmp, 0o600); } catch {}
+  fs.renameSync(tmp, CACHE_FILE);
 }
 
 export function clearCache() {
   try { fs.unlinkSync(CACHE_FILE); } catch {}
+}
+
+/** อ่าน session ที่แชร์กันอยู่ใน .token.json (ทุกโปรเซสใช้ไฟล์เดียวกัน) */
+export function readSharedSession() {
+  return readCache();
 }
 
 /** อ่าน exp จาก JWT (วินาที epoch) — ไม่ verify signature แค่ดูวันหมดอายุ */
@@ -51,23 +59,84 @@ function jwtExp(token) {
   } catch { return null; }
 }
 
-/** เช็คว่า token ยังใช้ได้จริงกับเซิร์ฟเวอร์ */
-export async function isTokenValid(token, baseUrl = 'https://web.duoke.com') {
-  if (!token) return false;
+/**
+ * ตรวจ token กับเซิร์ฟเวอร์ → 'valid' | 'invalid' | 'unknown'
+ * 'unknown' = เน็ตล่ม/เซิร์ฟเวอร์ตอบแปลก ๆ — ไม่ได้แปลว่า token เสีย
+ */
+export async function checkToken(token, baseUrl = 'https://web.duoke.com') {
+  if (!token) return 'invalid';
   const exp = jwtExp(token);
-  if (exp && exp * 1000 < Date.now() + 60_000) return false;      // หมดอายุ / ใกล้หมด
+  if (exp && exp * 1000 < Date.now() + 60_000) return 'invalid';   // หมดอายุ / ใกล้หมด
   try {
     const res = await fetch(`${baseUrl}/api/v1/im/conversation/queryTotalUnHandlerCount`, {
       headers: { Accept: 'application/json', 'x-access-token': token },
       signal: AbortSignal.timeout(15_000),
     });
-    if (res.status === 401 || res.status === 403) return false;
-    if (!res.ok) return false;
-    const body = await res.json();
-    return body.code === 0;
+    if (res.status === 401 || res.status === 403) return 'invalid';
+    if (!res.ok) return 'unknown';
+    const body = await res.json().catch(() => null);
+    if (body?.code === 0) return 'valid';
+    // code 401/403 ในบอดี้ = token เสียจริง · code อื่น = ไม่แน่ใจ อย่าเพิ่งทิ้ง token
+    return [401, 403, '401', '403'].includes(body?.code) ? 'invalid' : 'unknown';
   } catch {
-    return false;                       // เน็ตล่ม — ให้ไปล็อกอินใหม่ดีกว่าเดาว่าใช้ได้
+    return 'unknown';
   }
+}
+
+/**
+ * เช็คว่า token ยังใช้ได้ไหม
+ * ⚠ เดิมคืน false ตอนเน็ตกระตุก → ล็อกอินใหม่ → token ของโปรเซสอื่นโดนเตะทิ้งทั้งหมด
+ *   ตอนนี้ถ้าไม่แน่ใจ (เน็ตล่ม) ให้ถือว่ายังใช้ได้ ถ้าเสียจริงเดี๋ยว API จะตอบ 401 เอง
+ */
+export async function isTokenValid(token, baseUrl) {
+  return (await checkToken(token, baseUrl)) !== 'invalid';
+}
+
+// ------------------------------------------------------ lock (กันล็อกอินซ้อน)
+// หลายโปรเซส (watch.js / ui-server.js / outbox.js / reply.js) ใช้ token ชุดเดียวกัน
+// ถ้าต่างคนต่างล็อกอินเอง Duoke จะออก token ใหม่ แล้ว token เก่าของอีกโปรเซสใช้ไม่ได้
+// → วนเตะกันไปมาไม่จบ จึงให้ล็อกอินได้ทีละโปรเซส ที่เหลือรอแล้วหยิบ token ใหม่จากไฟล์ไปใช้
+
+const LOCK_FILE = path.join(__dirname, '.token.lock');
+const LOCK_STALE_MS = 10 * 60_000;           // ล็อกค้างนานเกินนี้ (โปรเซสตาย) → ยึดต่อได้
+const sleep = ms => new Promise(r => setTimeout(r, ms));
+
+function tryLock() {
+  try {
+    fs.writeFileSync(LOCK_FILE, JSON.stringify({ pid: process.pid, at: Date.now() }), { flag: 'wx' });
+    return true;
+  } catch {
+    try {
+      const st = fs.statSync(LOCK_FILE);
+      if (Date.now() - st.mtimeMs > LOCK_STALE_MS) { fs.unlinkSync(LOCK_FILE); return tryLock(); }
+    } catch { /* ล็อกเพิ่งถูกปล่อย */ }
+    return false;
+  }
+}
+function unlock() {
+  try {
+    const l = JSON.parse(fs.readFileSync(LOCK_FILE, 'utf8'));
+    if (l.pid === process.pid) fs.unlinkSync(LOCK_FILE);
+  } catch {}
+}
+
+/**
+ * แจ้งเตือนเมื่อโปรเซสอื่นเขียน token ใหม่ลง .token.json
+ * ใช้สลับ token ในโปรเซสที่รันค้างไว้ โดยไม่ต้องล็อกอินเอง
+ * @param {(session) => void} onChange
+ * @returns {() => void} ฟังก์ชันเลิกฟัง
+ */
+export function watchSharedSession(onChange, intervalMs = 3000) {
+  let last = readCache()?.token ?? null;
+  const listener = () => {
+    const s = readCache();
+    if (s?.token && s.token !== last) {
+      last = s.token;
+      try { onChange(s); } catch {}
+    }
+  };
+  fs.watchFile(CACHE_FILE, { interval: intervalMs }, listener);
+  return () => fs.unwatchFile(CACHE_FILE, listener);
 }
 
 // ------------------------------------------------------------------- login
@@ -137,15 +206,17 @@ export async function loginInteractive({ email, password, attempts = 3 } = {}) {
 
 /**
  * คืน token ที่ใช้งานได้ — ลำดับการหา:
- *   1. .token.json ที่แคชไว้ (ถ้ายัง valid)
- *   2. DUOKE_TOKEN ใน env (ถ้ายัง valid)
- *   3. ล็อกอินใหม่ด้วย DUOKE_EMAIL / DUOKE_PASSWORD
+ *   1. .token.json ที่แชร์กันทุกโปรเซส (ถ้ายังใช้ได้)
+ *   2. DUOKE_TOKEN ใน env (ถ้ายังใช้ได้)
+ *   3. ล็อกอินใหม่ — ทีละโปรเซสเท่านั้น (มีไฟล์ล็อก) ที่เหลือรอหยิบ token ใหม่จากไฟล์
  *
  * @param {object} [opts]
- * @param {boolean} [opts.force] บังคับล็อกอินใหม่ ไม่สนแคช
+ * @param {boolean} [opts.force]      บังคับล็อกอินใหม่ (npm run relogin)
+ * @param {string}  [opts.staleToken] token ที่เพิ่งโดน 401 — ถ้าในไฟล์ยังเป็นตัวนี้อยู่ค่อยล็อกอินใหม่
+ *                                    ถ้าโปรเซสอื่นล็อกอินไปแล้ว (ไฟล์มี token ใหม่) ก็ใช้ตัวใหม่เลย
  * @returns {Promise<{token:string, uid?:string, puid?:string, user?:object, source:string}>}
  */
-export async function getSession({ force = false, email, password } = {}) {
+export async function getSession({ force = false, staleToken, email, password } = {}) {
   email ??= process.env.DUOKE_EMAIL;
   password ??= process.env.DUOKE_PASSWORD;
 
@@ -162,39 +233,76 @@ export async function getSession({ force = false, email, password } = {}) {
     );
   }
 
-  if (!force) {
+  /** ลองใช้ token ที่มีอยู่แล้ว (ไฟล์ที่แชร์กัน → DUOKE_TOKEN) */
+  const reuse = async () => {
     const cached = readCache();
-    if (cached && cached.email === email) {
-      process.stdout.write('🔎 ตรวจ token ที่แคชไว้ ...');
+    if (cached && (!cached.email || cached.email === email) && cached.token !== staleToken) {
+      process.stdout.write('🔎 ตรวจ token ที่แชร์ไว้ (.token.json) ...');
       if (await isTokenValid(cached.token)) {
         process.stdout.write(' ยังใช้ได้\n');
         return { ...cached, source: 'cache' };
       }
       process.stdout.write(' ใช้ไม่ได้แล้ว\n');
     }
-    if (process.env.DUOKE_TOKEN) {
+    const envTok = process.env.DUOKE_TOKEN;
+    if (envTok && envTok !== staleToken) {
       process.stdout.write('🔎 ตรวจ DUOKE_TOKEN จาก .env ...');
-      if (await isTokenValid(process.env.DUOKE_TOKEN)) {
+      if (await isTokenValid(envTok)) {
         process.stdout.write(' ยังใช้ได้\n');
-        return { token: process.env.DUOKE_TOKEN, source: 'env' };
+        return { token: envTok, source: 'env' };
       }
       process.stdout.write(' ใช้ไม่ได้แล้ว\n');
     }
+    return null;
+  };
+
+  if (!force) {
+    const s = await reuse();
+    if (s) return s;
   }
 
-  const data = method === 'terminal'
-    ? await loginInteractive({ email, password })
-    : await loginViaBrowser({ email, onStatus: (m) => console.log(m) });
-  const session = {
-    token: data.token,
-    uid: data.uid,
-    puid: data.puid,
-    email,
-    loginAt: Date.now(),
-    expAt: (() => { const e = jwtExp(data.token); return e ? e * 1000 : null; })(),
-  };
-  writeCache(session);
-  return { ...session, user: data.user, source: 'login' };
+  // ---- ต้องล็อกอินใหม่: ให้ทำทีละโปรเซส ----
+  let waited = false;
+  while (!tryLock()) {
+    if (!waited) { console.log('⏳ มีโปรเซสอื่นกำลังล็อกอินอยู่ — รอใช้ token ชุดเดียวกัน ...'); waited = true; }
+    await sleep(2000);
+    const cached = readCache();
+    if (cached?.token && cached.token !== staleToken && (!cached.email || cached.email === email)
+        && await isTokenValid(cached.token)) {
+      return { ...cached, source: 'shared' };
+    }
+  }
+
+  try {
+    // ได้ล็อกแล้ว — เช็คซ้ำอีกรอบ เผื่อโปรเซสอื่นเพิ่งล็อกอินเสร็จก่อนหน้าเสี้ยววินาที
+    if (!force || waited) {
+      const s = await reuse();
+      if (s) return s;
+    }
+    const data = method === 'terminal'
+      ? await loginInteractive({ email, password })
+      : await loginViaBrowser({ email, onStatus: (m) => console.log(m) });
+    const session = {
+      token: data.token,
+      uid: data.uid,
+      puid: data.puid,
+      email,
+      loginAt: Date.now(),
+      expAt: (() => { const e = jwtExp(data.token); return e ? e * 1000 : null; })(),
+    };
+    writeCache(session);
+    return { ...session, user: data.user, source: 'login' };
+  } finally {
+    unlock();
+  }
+}
+
+/**
+ * token ที่ใช้อยู่โดน 401 → ขอ token ที่ใช้ได้ "โดยไม่ล็อกอินซ้ำถ้าไม่จำเป็น"
+ * ถ้าโปรเซสอื่นล็อกอินไปแล้วจะได้ token ตัวใหม่จากไฟล์ทันที
+ */
+export function refreshSession(staleToken, opts = {}) {
+  return getSession({ ...opts, staleToken });
 }
 
 /** เอาแค่ token */

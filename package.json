@@ -15,18 +15,41 @@
     "example": "node example.js",
     "ai-test": "node ai-test.js",
     "learn": "node learn-replies.js",
-    "relogin": "node duoke-session.js --force"
+    "relogin": "node duoke-session.js --force",
+    "ui": "vite build && node ui-server.js",
+    "ui:build": "vite build",
+    "ui:dev": "concurrently -k -n api,web -c gray,cyan \"nodemon --watch ui-server.js --watch db.js ui-server.js\" \"vite\"",
+    "db:generate": "prisma generate",
+    "db:push": "prisma db push",
+    "db:migrate": "prisma migrate dev",
+    "db:studio": "prisma studio",
+    "postinstall": "prisma generate || exit 0",
+    "ui:serve": "node ui-server.js",
+    "dev:all": "concurrently -k -n bot,ui -c yellow,cyan \"nodemon watch.js\" \"npm run ui\""
   },
   "dependencies": {
     "@anthropic-ai/sdk": "^0.124.0",
     "openai": "^7.10.0",
     "puppeteer-core": "^23.11.1",
-    "socket.io-client": "^4.7.5"
+    "socket.io-client": "^4.7.5",
+    "@prisma/client": "^6.19.3",
+    "express": "^5.1.0"
   },
   "devDependencies": {
-    "nodemon": "^3.1.0"
+    "nodemon": "^3.1.0",
+    "prisma": "^6.19.3",
+    "vite": "^6.3.5",
+    "@vitejs/plugin-react": "^4.7.0",
+    "typescript": "^5.9.3",
+    "react": "^19.1.0",
+    "react-dom": "^19.1.0",
+    "react-router-dom": "^6.30.1",
+    "lucide-react": "^0.540.0",
+    "@types/react": "^19.1.0",
+    "@types/react-dom": "^19.1.0",
+    "concurrently": "^9.2.0"
   },
   "engines": {
-    "node": ">=18"
+    "node": ">=18.18"
   }
 }
